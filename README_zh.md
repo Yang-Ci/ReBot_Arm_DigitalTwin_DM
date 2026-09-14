@@ -1,4 +1,4 @@
-# reBot Arm MuJoCo DM
+# ReBot Arm 数字孪生与控制平台 — B601-DM
 
 > English: [README.md](./README.md)
 
@@ -100,7 +100,7 @@ pip install -e .    # 可编辑安装，或直接用 sys.path 引用
 `setup.sh` 自动完成 venv 创建（`--system-site-packages`）、Python 依赖安装、`tf_transformations` 提取、导入验证和 `colcon build`：
 
 ```bash
-cd ~/reBot_Arm_Mujoco-DM
+cd ~/ReBot_Arm_DigitalTwin_DM
 ./setup.sh
 ```
 
@@ -145,8 +145,8 @@ cd ~/reBot_Arm_Mujoco-DM
 ### 克隆后一键安装（推荐）
 
 ```bash
-git clone https://github.com/Seeed-Projects/Borot-Arm_Mujoco.git
-cd reBot_Arm_Mujoco-DM
+git clone https://github.com/Yang-Ci/ReBot_Arm_DigitalTwin_DM.git
+cd ReBot_Arm_DigitalTwin_DM
 ./setup.sh
 ./rebotarm doctor
 ```
@@ -174,7 +174,7 @@ sudo chmod 666 /dev/ttyACM*
 所有命令前先 source 环境（统一启动入口自启动）：
 
 ```bash
-cd ~/reBot_Arm_Mujoco-DM/reBotArm_ros2_DM
+cd ~/ReBot_Arm_DigitalTwin_DM/reBotArm_ros2_DM
 source scripts/source_rebotarm_env.sh
 ```
 
@@ -209,7 +209,7 @@ ros2 service call /rebotarm/safe_home std_srvs/srv/Trigger   # 安全回零
 **Terminal 2 — rosbridge：**
 
 ```bash
-cd ~/reBot_Arm_Mujoco-DM/reBotArm_ros2_DM
+cd ~/ReBot_Arm_DigitalTwin_DM/reBotArm_ros2_DM
 source scripts/source_rebotarm_env.sh
 ros2 launch rosbridge_server rosbridge_websocket_launch.xml port:=9090
 ```
@@ -217,7 +217,7 @@ ros2 launch rosbridge_server rosbridge_websocket_launch.xml port:=9090
 **Terminal 3 — Web 服务器：**
 
 ```bash
-cd ~/reBot_Arm_Mujoco-DM/reBotArm_simulator-DM
+cd ~/ReBot_Arm_DigitalTwin_DM/reBotArm_simulator-DM
 cp .env.example .env   # 首次使用：复制环境变量模板
 # 编辑 .env，把 localhost 改成虚拟机 IP（如 ws://192.168.x.x:9090）
 node server.js

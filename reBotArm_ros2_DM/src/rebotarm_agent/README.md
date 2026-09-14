@@ -58,7 +58,7 @@ ros2 launch rebotarm_agent rebotarm_mcp.launch.py
 The launch file runs the MCP server through:
 
 ```text
-~/reBot_Arm_Mujoco-DM/reBotArm_ros2_DM/.venv/bin/python3
+~/ReBot_Arm_DigitalTwin_DM/reBotArm_ros2_DM/.venv/bin/python3
 ```
 
 This keeps `fastmcp` inside the workspace virtual environment instead of the

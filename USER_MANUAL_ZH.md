@@ -50,8 +50,8 @@
 
 ```bash
 cd ~
-git clone <本仓库地址> reBot_Arm_Mujoco-DM
-cd reBot_Arm_Mujoco-DM
+git clone <本仓库地址> ReBot_Arm_DigitalTwin_DM
+cd ReBot_Arm_DigitalTwin_DM
 ```
 
 确认一键入口存在：
@@ -197,7 +197,7 @@ tornado, psutil, fastmcp, openai
 新用户默认 SDK 路径：
 
 ```text
-reBot_Arm_Mujoco-DM/reBotArm_ros2_DM/third_party/reBotArm_control_py
+ReBot_Arm_DigitalTwin_DM/reBotArm_ros2_DM/third_party/reBotArm_control_py
 ```
 
 如果已经存在以下 SDK，安装器会优先保留：
@@ -240,7 +240,7 @@ DM 真机与仿真模式应分开使用，不要同时启动。
 打开终端 1：
 
 ```bash
-cd ~/reBot_Arm_Mujoco-DM
+cd ~/ReBot_Arm_DigitalTwin_DM
 ./rebotarm start web
 ```
 
@@ -303,7 +303,7 @@ sudo chmod 666 /dev/ttyACM0
 打开终端 2：
 
 ```bash
-cd ~/reBot_Arm_Mujoco-DM
+cd ~/ReBot_Arm_DigitalTwin_DM
 ./rebotarm start dm
 ```
 
@@ -326,7 +326,7 @@ SERIAL_CHANNEL=/dev/ttyACM1 ./rebotarm start dm
 打开终端 3：
 
 ```bash
-cd ~/reBot_Arm_Mujoco-DM
+cd ~/ReBot_Arm_DigitalTwin_DM
 ./rebotarm status
 ```
 
@@ -342,7 +342,7 @@ cd ~/reBot_Arm_Mujoco-DM
 读取一次关节状态：
 
 ```bash
-cd ~/reBot_Arm_Mujoco-DM/reBotArm_ros2_DM
+cd ~/ReBot_Arm_DigitalTwin_DM/reBotArm_ros2_DM
 source scripts/source_rebotarm_env.sh
 ros2 topic echo /rebotarm/joint_states --once
 ```
@@ -472,7 +472,7 @@ ros2 action list -t
 确保 DM 真机控制器已经停止，然后执行：
 
 ```bash
-cd ~/reBot_Arm_Mujoco-DM
+cd ~/ReBot_Arm_DigitalTwin_DM
 ./rebotarm start sim
 ```
 
@@ -496,7 +496,7 @@ cd ~/reBot_Arm_Mujoco-DM
 5. 执行状态检查。
 
 ```bash
-cd ~/reBot_Arm_Mujoco-DM
+cd ~/ReBot_Arm_DigitalTwin_DM
 ./rebotarm status
 ```
 
@@ -507,7 +507,7 @@ cd ~/reBot_Arm_Mujoco-DM
 拉取代码：
 
 ```bash
-cd ~/reBot_Arm_Mujoco-DM
+cd ~/ReBot_Arm_DigitalTwin_DM
 git pull
 ```
 
@@ -522,7 +522,7 @@ git pull
 只重新编译 ROS 工作空间：
 
 ```bash
-cd ~/reBot_Arm_Mujoco-DM/reBotArm_ros2_DM
+cd ~/ReBot_Arm_DigitalTwin_DM/reBotArm_ros2_DM
 source scripts/source_rebotarm_env.sh
 colcon build --symlink-install
 ```
