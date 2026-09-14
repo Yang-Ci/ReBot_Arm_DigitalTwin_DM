@@ -347,7 +347,16 @@ if [[ -f "/opt/ros/${ROS_DISTRO}/setup.bash" ]]; then
   else
     log 'Resolving ROS dependencies and building the workspace'
     # shellcheck source=/dev/null
+    restore_nounset=false
+    if [[ $- == *u* ]]; then
+      restore_nounset=true
+      set +u
+    fi
     source /opt/ros/${ROS_DISTRO}/setup.bash
+    if [[ "${restore_nounset}" == true ]]; then
+      set -u
+    fi
+    unset restore_nounset
     if have rosdep; then
       if [[ ! -f /etc/ros/rosdep/sources.list.d/20-default.list ]]; then
         if ! run_sudo rosdep init; then
