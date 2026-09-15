@@ -6,6 +6,17 @@ channel: /dev/ttyACM0
 # 控制循环频率 (Hz)
 rate: 100
 
+# 真机重力补偿参数。ROS 控制层优先读取这里的配置。
+gravity_compensation:
+  kp: 1.5
+  kd: 1.0
+  joint_direction: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  tau_scale: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  # 0 表示不增加 ROS 侧限幅，仍保留电机驱动自身的力矩范围保护。
+  # 完成各关节真机标定后可改成六个正数，单位 N·m。
+  torque_limit: 0.0
+  transition_duration: 0.5
+
 joints:
   # joint1:
   - name: joint1

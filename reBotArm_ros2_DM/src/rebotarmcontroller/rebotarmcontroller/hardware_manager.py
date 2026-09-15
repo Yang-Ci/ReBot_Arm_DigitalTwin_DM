@@ -18,11 +18,12 @@ _G_ARRIVE_TOL = 0.12
 _G_TAU_MAX = 1.5
 _G_DEFAULT_FORCE = 0.30
 _G_CTRL_RATE = 50.0
-_GC_VEL_THRESHOLD = 0.04
-_GC_W_VEL_THRESHOLD = 0.08
-_GC_EE_FRAME = "end_link"
-_GC_KP = 7.0
-_GC_KD = 0.8
+_GC_DEFAULT_KP = 1.5
+_GC_DEFAULT_KD = 1.0
+_GC_DEFAULT_TAU_SCALE = 1.0
+_GC_DEFAULT_JOINT_DIRECTION = 1.0
+_GC_DEFAULT_TORQUE_LIMIT = 0.0
+_GC_DEFAULT_TRANSITION_DURATION = 0.5
 
 
 class HardwareManager:
@@ -40,18 +41,20 @@ class HardwareManager:
         from reBotArm_control_py.controllers import RebotArmEndPose
         from reBotArm_control_py.kinematics import load_robot_model
         from reBotArm_control_py.dynamics import compute_generalized_gravity
-        import pinocchio as pin
 
+        requested_cfg_path = Path(arm_cfg).expanduser() if arm_cfg else None
         cfg_path = self._resolve_hw_cfg(
-            Path(arm_cfg).expanduser() if arm_cfg else self.default_arm_cfg(),
+            requested_cfg_path if requested_cfg_path else self.default_arm_cfg(),
             channel,
         )
         self._arm = RebotArm(hw_yaml=str(cfg_path))
         self._gc_model = load_robot_model()
         self._gc_data = self._gc_model.createData()
-        self._gc_ee_frame_id = self._gc_model.getFrameId(_GC_EE_FRAME)
         self._gc_compute_generalized_gravity = compute_generalized_gravity
-        self._gc_pin = pin
+        self._load_gravity_compensation_config(
+            cfg_path,
+            requested_cfg_path=requested_cfg_path,
+        )
 
         self._gripper_cfg_path = (
             Path(gripper_cfg).expanduser() if gripper_cfg else self.default_gripper_cfg()
@@ -80,9 +83,12 @@ class HardwareManager:
         self._error_codes: list[str] = []
         self._gravity_comp_active = False
         self._gravity_comp_q_target: np.ndarray | None = None
-        self._gravity_comp_integral: np.ndarray | None = None
-        self._gravity_comp_lock_counter = 0
         self._gravity_comp_q_last: np.ndarray | None = None
+        self._gravity_comp_transition_q_hold: np.ndarray | None = None
+        self._gravity_comp_transition_started_at: float | None = None
+        self._gravity_comp_hold_kp: np.ndarray | None = None
+        self._gravity_comp_hold_kd: np.ndarray | None = None
+        self._gravity_comp_fault = ""
 
     def default_arm_cfg(self) -> Path:
         return self._sdk_root / "config" / "rebotarm_dm.yaml"
@@ -145,6 +151,91 @@ class HardwareManager:
         with open(tmp_path, "w", encoding="utf-8") as f:
             yaml.safe_dump(data, f, sort_keys=False)
         return tmp_path
+
+    @staticmethod
+    def _config_vector(value, size: int, label: str, default: float) -> np.ndarray:
+        if value is None:
+            return np.full(size, float(default), dtype=np.float64)
+        if isinstance(value, (int, float)):
+            return np.full(size, float(value), dtype=np.float64)
+        values = np.asarray(value, dtype=np.float64).reshape(-1)
+        if values.size == 1:
+            return np.full(size, float(values[0]), dtype=np.float64)
+        if values.size != size:
+            raise ValueError(f"{label} must be a scalar or {size} values")
+        return values.copy()
+
+    @staticmethod
+    def _read_gravity_config(path: Path | None) -> dict:
+        if path is None or not path.is_file():
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        gravity_config = data.get("gravity_compensation", {}) or {}
+        if not isinstance(gravity_config, dict):
+            raise ValueError("gravity_compensation must be a mapping")
+        return gravity_config
+
+    def _load_gravity_compensation_config(
+        self,
+        resolved_cfg_path: Path,
+        *,
+        requested_cfg_path: Path | None,
+    ) -> None:
+        """Load gravity settings, preferring the ROS-side config when present."""
+        gravity_config = self._read_gravity_config(resolved_cfg_path)
+        requested_config = self._read_gravity_config(requested_cfg_path)
+        gravity_config.update(requested_config)
+
+        n = self._arm.arm.num_joints
+        self._gc_kp = self._config_vector(
+            gravity_config.get("kp"),
+            n,
+            "gravity_compensation.kp",
+            _GC_DEFAULT_KP,
+        )
+        self._gc_kd = self._config_vector(
+            gravity_config.get("kd"),
+            n,
+            "gravity_compensation.kd",
+            _GC_DEFAULT_KD,
+        )
+        self._gc_tau_scale = self._config_vector(
+            gravity_config.get("tau_scale"),
+            n,
+            "gravity_compensation.tau_scale",
+            _GC_DEFAULT_TAU_SCALE,
+        )
+        self._gc_joint_direction = self._config_vector(
+            gravity_config.get("joint_direction"),
+            n,
+            "gravity_compensation.joint_direction",
+            _GC_DEFAULT_JOINT_DIRECTION,
+        )
+        self._gc_torque_limit = self._config_vector(
+            gravity_config.get("torque_limit"),
+            n,
+            "gravity_compensation.torque_limit",
+            _GC_DEFAULT_TORQUE_LIMIT,
+        )
+        self._gc_transition_duration = max(
+            float(
+                gravity_config.get(
+                    "transition_duration",
+                    _GC_DEFAULT_TRANSITION_DURATION,
+                )
+            ),
+            0.0,
+        )
+
+        if np.any(self._gc_kp < 0.0) or np.any(self._gc_kd < 0.0):
+            raise ValueError("gravity compensation kp/kd must be non-negative")
+        if np.any(self._gc_tau_scale < 0.0):
+            raise ValueError("gravity compensation tau_scale must be non-negative")
+        if np.any(self._gc_torque_limit < 0.0):
+            raise ValueError("gravity compensation torque_limit must be non-negative")
+        if not np.all(np.isin(self._gc_joint_direction, (-1.0, 1.0))):
+            raise ValueError("gravity compensation joint_direction values must be +1 or -1")
 
     @property
     def arm(self):
@@ -362,19 +453,51 @@ class HardwareManager:
         self._stop_control_loop()
         self._endpos_ctrl._stop_send.set()
         self._endpos_ctrl._moving = False
-        self._gravity_comp_q_target = self._arm.arm.get_positions(request_feedback=True).copy()
-        self._gravity_comp_q_last = self._gravity_comp_q_target.copy()
-        initial_tau_g = self._gravity_torque(self._gravity_comp_q_target)
-        self._enter_gravity_compensation_mode(
-            self._gravity_comp_q_target,
-            initial_tau_g,
-        )
-        self._gravity_comp_integral = np.zeros_like(self._gravity_comp_q_target)
-        self._gravity_comp_lock_counter = 0
-        self._gravity_comp_active = True
-        self._gravity_comp_tick(self._arm, 1.0 / float(self._arm._rate))
-        self._arm.start_control_loop(self._gravity_comp_tick, rate=self._arm._rate)
-        self.set_state_machine("GRAVITY_COMP")
+        q_hold = self._arm.arm.get_positions(request_feedback=True).copy()
+        self._gravity_comp_q_target = q_hold.copy()
+        self._gravity_comp_q_last = q_hold.copy()
+        self._gravity_comp_transition_q_hold = q_hold.copy()
+        self._gravity_comp_hold_kp = self._arm.arm._mit_kp.copy()
+        self._gravity_comp_hold_kd = self._arm.arm._mit_kd.copy()
+        self._gravity_comp_fault = ""
+        self._error_codes = [
+            code for code in self._error_codes if not code.startswith("GRAVITY_COMP_FAULT:")
+        ]
+
+        entered_mit = False
+        try:
+            initial_tau_g = self._gravity_torque(q_hold)
+            self._enter_gravity_compensation_mode(
+                q_hold,
+                initial_tau_g,
+                self._gravity_comp_hold_kp,
+                self._gravity_comp_hold_kd,
+            )
+            entered_mit = True
+            self._gravity_comp_active = True
+            self._gravity_comp_transition_started_at = time.perf_counter()
+
+            # Validate one complete iteration before handing control to the
+            # background thread. Any model/configuration error is rolled back
+            # to POS_VEL instead of leaving the motors stranded in MIT mode.
+            self._gravity_comp_tick(self._arm, 1.0 / float(self._arm._rate))
+            self._arm.start_control_loop(
+                self._gravity_comp_tick_guarded,
+                rate=self._arm._rate,
+            )
+            self.set_state_machine("GRAVITY_COMP")
+        except Exception as exc:
+            self._gravity_comp_fault = f"{type(exc).__name__}: {exc}"
+            self._gravity_comp_active = False
+            self._clear_gravity_compensation_state(keep_fault=True)
+            if self._enabled:
+                if entered_mit:
+                    self._arm.arm.mode_pos_vel()
+                self._start_pos_vel_loop(target=q_hold)
+            self.set_state_machine("IDLE")
+            raise RuntimeError(
+                f"gravity compensation startup failed; restored POS_VEL: {exc}"
+            ) from exc
 
     def stop_gravity_compensation(self) -> None:
         if not self._gravity_comp_active:
@@ -386,14 +509,24 @@ class HardwareManager:
         )
         self._arm.stop_control_loop()
         self._gravity_comp_active = False
-        self._gravity_comp_q_target = None
-        self._gravity_comp_integral = None
-        self._gravity_comp_lock_counter = 0
-        self._gravity_comp_q_last = None
+        self._clear_gravity_compensation_state()
+        self._error_codes = [
+            code for code in self._error_codes if not code.startswith("GRAVITY_COMP_FAULT:")
+        ]
         if self._enabled:
             self._arm.arm.mode_pos_vel()
             self._start_pos_vel_loop(target=hold_target)
         self.set_state_machine("IDLE")
+
+    def _clear_gravity_compensation_state(self, *, keep_fault: bool = False) -> None:
+        self._gravity_comp_q_target = None
+        self._gravity_comp_q_last = None
+        self._gravity_comp_transition_q_hold = None
+        self._gravity_comp_transition_started_at = None
+        self._gravity_comp_hold_kp = None
+        self._gravity_comp_hold_kd = None
+        if not keep_fault:
+            self._gravity_comp_fault = ""
 
     def gravity_compensation_active(self) -> bool:
         return self._gravity_comp_active
@@ -402,6 +535,9 @@ class HardwareManager:
         if self._gravity_comp_q_target is None:
             return None
         return self._gravity_comp_q_target.copy()
+
+    def gravity_compensation_fault(self) -> str:
+        return self._gravity_comp_fault
 
     @staticmethod
     def _angles_near_reference(values: np.ndarray, reference: np.ndarray) -> np.ndarray:
@@ -425,18 +561,27 @@ class HardwareManager:
     def _gravity_torque(self, q: np.ndarray) -> np.ndarray:
         from reBotArm_control_py.kinematics import pad_q_for_model
 
-        q_padded = pad_q_for_model(self._gc_model, q, len(q))
+        q_for_model = q * self._gc_joint_direction
+        q_padded = pad_q_for_model(self._gc_model, q_for_model, len(q))
         tau_g = self._gc_compute_generalized_gravity(
             self._gc_model,
             q_padded,
             self._gc_data,
         )
-        return np.asarray(tau_g[: len(q)], dtype=np.float64)
+        tau_motor = (
+            np.asarray(tau_g[: len(q)], dtype=np.float64)
+            * self._gc_joint_direction
+            * self._gc_tau_scale
+        )
+        limits = np.where(self._gc_torque_limit > 0.0, self._gc_torque_limit, np.inf)
+        return np.clip(tau_motor, -limits, limits)
 
     def _enter_gravity_compensation_mode(
         self,
         q_hold: np.ndarray,
         tau_g: np.ndarray,
+        kp: np.ndarray,
+        kd: np.ndarray,
     ) -> None:
         """Enter MIT one joint at a time while holding the measured pose.
 
@@ -448,8 +593,6 @@ class HardwareManager:
         from motorbridge import Mode
 
         group = self._arm.arm
-        kp = np.full(group.num_joints, _GC_KP, dtype=np.float64)
-        kd = np.full(group.num_joints, _GC_KD, dtype=np.float64)
         for index, joint_name in enumerate(group.joint_names):
             motor = self._arm._motor_map[joint_name]
             motor.ensure_mode(Mode.MIT, 1000)
@@ -461,8 +604,21 @@ class HardwareManager:
                 float(tau_g[index]),
             )
         group._mode = "mit"
-        group._mit_kp = kp
-        group._mit_kd = kd
+
+    def _gravity_transition_blend(self) -> float:
+        if self._gc_transition_duration <= 0.0:
+            return 1.0
+        started_at = self._gravity_comp_transition_started_at
+        if started_at is None:
+            return 0.0
+        ratio = float(
+            np.clip(
+                (time.perf_counter() - started_at) / self._gc_transition_duration,
+                0.0,
+                1.0,
+            )
+        )
+        return ratio * ratio * (3.0 - 2.0 * ratio)
 
     def _gravity_comp_tick(self, arm, dt: float) -> None:
         del dt
@@ -470,41 +626,78 @@ class HardwareManager:
             return
 
         q = self._read_gravity_comp_positions()
-        qd = arm.arm.get_velocities()
         tau_g = self._gravity_torque(q)
 
-        q_error = self._gravity_comp_q_target - q
-        if self._gravity_comp_integral is None:
-            self._gravity_comp_integral = np.zeros_like(q)
-        self._gravity_comp_integral += q_error * 1.0
-        np.clip(self._gravity_comp_integral, -0.5, 0.5, out=self._gravity_comp_integral)
-
-        self._gc_pin.computeJointJacobians(self._gc_model, self._gc_data, q)
-        self._gc_pin.updateFramePlacements(self._gc_model, self._gc_data)
-        jacobian = self._gc_pin.getFrameJacobian(
-            self._gc_model,
-            self._gc_data,
-            self._gc_ee_frame_id,
-            self._gc_pin.ReferenceFrame.WORLD,
-        )
-        spatial_velocity = jacobian @ qd
-        linear_speed = float(np.linalg.norm(spatial_velocity[:3]))
-        angular_speed = float(np.linalg.norm(spatial_velocity[3:]))
-
-        if linear_speed > _GC_VEL_THRESHOLD or angular_speed > _GC_W_VEL_THRESHOLD:
-            self._gravity_comp_q_target = q.copy()
-            self._gravity_comp_lock_counter = 0
-            self._gravity_comp_integral *= 0.9
+        blend = self._gravity_transition_blend()
+        q_hold = self._gravity_comp_transition_q_hold
+        hold_kp = self._gravity_comp_hold_kp
+        hold_kd = self._gravity_comp_hold_kd
+        if q_hold is None or hold_kp is None or hold_kd is None:
+            q_target = q.copy()
+            kp = self._gc_kp
+            kd = self._gc_kd
         else:
-            self._gravity_comp_lock_counter += 1
+            q_target = q_hold + blend * (q - q_hold)
+            kp = hold_kp + blend * (self._gc_kp - hold_kp)
+            kd = hold_kd + blend * (self._gc_kd - hold_kd)
+            if blend >= 1.0:
+                self._gravity_comp_transition_q_hold = None
+
+        # In gravity-compensation mode the position target follows the measured
+        # pose. The low MIT gains provide damping/compliance without pulling the
+        # arm back toward a stale lock target.
+        self._gravity_comp_q_target = q_target.copy()
 
         arm.arm.send_mit(
-            pos=self._gravity_comp_q_target,
+            pos=q_target,
             vel=np.zeros(arm.arm.num_joints),
-            kp=np.full(arm.arm.num_joints, _GC_KP),
-            kd=np.full(arm.arm.num_joints, _GC_KD),
-            tau=tau_g + self._gravity_comp_integral,
+            kp=kp,
+            kd=kd,
+            tau=tau_g,
         )
+
+    def _gravity_comp_tick_guarded(self, arm, dt: float) -> None:
+        try:
+            self._gravity_comp_tick(arm, dt)
+        except Exception as exc:
+            fault = f"{type(exc).__name__}: {exc}"
+            self._gravity_comp_fault = fault
+            self._error_codes = [f"GRAVITY_COMP_FAULT: {fault}"]
+            self._gravity_comp_active = False
+            recovery_target = (
+                self._gravity_comp_q_last.copy()
+                if self._gravity_comp_q_last is not None
+                else None
+            )
+            # The SDK loop cannot join itself. Ask it to exit, then recover the
+            # motor mode from a separate thread after the callback returns.
+            arm._running = False
+            threading.Thread(
+                target=self._recover_from_gravity_compensation_fault,
+                args=(recovery_target,),
+                name="rebotarm-gravity-recovery",
+                daemon=True,
+            ).start()
+
+    def _recover_from_gravity_compensation_fault(
+        self,
+        target: np.ndarray | None,
+    ) -> None:
+        control_thread = getattr(self._arm, "_ctrl_thread", None)
+        if control_thread is not None and control_thread is not threading.current_thread():
+            control_thread.join(timeout=1.0)
+        self._clear_gravity_compensation_state(keep_fault=True)
+        try:
+            if self._enabled:
+                self._arm.arm.mode_pos_vel()
+                self._start_pos_vel_loop(target=target)
+        except Exception as exc:
+            self._gravity_comp_fault += (
+                f"; POS_VEL recovery failed: {type(exc).__name__}: {exc}"
+            )
+            self._error_codes = [f"GRAVITY_COMP_FAULT: {self._gravity_comp_fault}"]
+        finally:
+            self.set_state_machine("IDLE")
 
     def current_pose(self):
         from reBotArm_control_py.kinematics import compute_fk, pad_q_for_model

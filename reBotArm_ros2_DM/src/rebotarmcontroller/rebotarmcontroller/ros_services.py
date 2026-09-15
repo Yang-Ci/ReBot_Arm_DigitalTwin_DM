@@ -166,9 +166,14 @@ class ArmServices:
             response.success = bool(active)
             if target is not None:
                 deg = ", ".join(f"{math.degrees(float(v)):+.1f}" for v in target)
-                response.message = f"gravity compensation active; lock target deg=[{deg}]"
+                response.message = f"gravity compensation active; current target deg=[{deg}]"
             else:
-                response.message = "gravity compensation inactive"
+                fault = self._hardware.gravity_compensation_fault()
+                response.message = (
+                    f"gravity compensation inactive; last fault: {fault}"
+                    if fault
+                    else "gravity compensation inactive"
+                )
         except Exception as exc:
             response.success = False
             response.message = str(exc)

@@ -29,8 +29,12 @@ models:
         mit_kp: [120.0, 120.0, 120.0, 18.0, 18.0, 18.0]
         mit_kd: [8.0, 8.0, 8.0, 2.0, 2.0, 2.0]
       gravity_compensation:
-        kp: 2.0
-        kd: 1.5
+        kp: 1.5
+        kd: 1.0
+        joint_direction: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+        tau_scale: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+        torque_limit: 0.0
+        transition_duration: 0.5
 
   rs:
     sdk_config: rebotarm_rs.yaml

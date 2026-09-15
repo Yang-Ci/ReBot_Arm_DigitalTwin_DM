@@ -216,8 +216,12 @@ sequenceDiagram
 补偿循环的核心输出为：
 
 ```text
-tau_cmd = tau_gravity(q) + position_hold + damping + integral_correction
+tau_cmd = tau_gravity(q) + compliant_position_term + damping
 ```
+
+进入重补后的 0.5 秒内，位置目标和 MIT 增益从启动保持状态平滑过渡到
+柔顺状态；过渡完成后位置目标跟随实时反馈，不再用旧目标拉回机械臂。
+重力力矩支持逐关节方向、缩放和可选限幅配置。
 
 重力补偿已经运行时再次调用 start 会被忽略，不停止循环、不切换模式、不重新上电。
 
@@ -235,7 +239,7 @@ tau_cmd = tau_gravity(q) + position_hold + damping + integral_correction
   → 状态机返回 IDLE
 ```
 
-连接 ROS 时网页不会自动查询或启动重力补偿。用户点击“查询状态”可主动查询；控制器进入重力补偿后，网页会每 500 ms 静默刷新锁定目标角度，停止重补或断开后停止刷新：
+连接 ROS 时网页不会自动查询或启动重力补偿。用户点击“查询状态”可主动查询；控制器进入重力补偿后，网页会每 500 ms 静默刷新当前目标角度，停止重补或断开后停止刷新：
 
 ```text
 /rebotarm/gravity_compensation/status
