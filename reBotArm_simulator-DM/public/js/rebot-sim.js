@@ -112,8 +112,19 @@ const t = window.rebotI18n ? window.rebotI18n.t : (k) => k;
   let teachingLastSample = 0;
   let teachingWaypoints = [];
   let teachingPlayback = null;
+  let teachingSource = 'web';
+  let teachingMode = 'path';
+  let hardwareTeachOriginNs = null;
+  let hardwareTeachFallbackStart = 0;
+  let hardwareTeachLastStatusAt = 0;
   const TEACH_SAMPLE_INTERVAL_MS = 90;
   const TEACH_MIN_TCP_STEP = 0.004;
+  const TEACH_ENDPOINT_DURATION_MS = 3000;
+  const TEACH_REPLAY_RETURN_SPEED_RAD_S = 0.8;
+  const TEACH_REPLAY_SAMPLE_HZ = 30;
+  // Keep 30 Hz resolution for typical recordings up to one minute. The ROS
+  // controller interpolates between points; this ceiling preserves longer paths.
+  const TEACH_REPLAY_MAX_POINTS = 1800;
   const commandListeners = new Set();
   const axisLabelSprites = [];
 
@@ -128,8 +139,12 @@ const t = window.rebotI18n ? window.rebotI18n.t : (k) => k;
     dragHud: document.getElementById('drag-hud'),
     dragStatus: document.getElementById('drag-status'),
     teachRecord: document.getElementById('teach-record'),
+    teachHardwareMode: document.getElementById('teach-hardware-mode'),
+    teachHardwareRecord: document.getElementById('teach-hardware-record'),
     teachReplay: document.getElementById('teach-replay'),
     teachExport: document.getElementById('teach-export'),
+    teachImport: document.getElementById('teach-import'),
+    teachImportFile: document.getElementById('teach-import-file'),
     teachClear: document.getElementById('teach-clear'),
     teachStatus: document.getElementById('teach-status'),
     teachExportText: document.getElementById('teach-export-text'),
@@ -912,12 +927,34 @@ const t = window.rebotI18n ? window.rebotI18n.t : (k) => k;
     document.getElementById('play-path').addEventListener('click', playPath);
     document.getElementById('stop-path').addEventListener('click', () => {
       stopPath();
-      teachingPlayback = null;
-      updateTeachingStatus();
+      stopTeachingReplay();
     });
     if (els.planTrajectory) els.planTrajectory.addEventListener('click', generateTrajectory);
     if (els.toggleDrag) els.toggleDrag.addEventListener('click', toggleDragMode);
     if (els.teachRecord) els.teachRecord.addEventListener('click', toggleTeachingRecord);
+    if (els.teachImport) {
+      els.teachImport.addEventListener('click', () => {
+        if (els.teachImportFile) els.teachImportFile.click();
+      });
+    }
+    if (els.teachImportFile) {
+      els.teachImportFile.addEventListener('change', () => {
+        const file = els.teachImportFile.files && els.teachImportFile.files[0];
+        if (file) void importTeachingFile(file);
+        els.teachImportFile.value = '';
+      });
+    }
+    if (els.teachExportText) {
+      els.teachExportText.addEventListener('change', () => {
+        const text = els.teachExportText.value.trim();
+        if (!text) return;
+        try {
+          importTeachingText(text);
+        } catch (error) {
+          updateTeachingStatus(t('sim.importFailed', { error: error.message || error }));
+        }
+      });
+    }
     if (els.teachReplay) els.teachReplay.addEventListener('click', replayTeaching);
     if (els.teachExport) els.teachExport.addEventListener('click', exportTeachingWaypoints);
     if (els.teachClear) els.teachClear.addEventListener('click', clearTeaching);
@@ -1386,12 +1423,132 @@ const t = window.rebotI18n ? window.rebotI18n.t : (k) => k;
     if (els.dragStatus) els.dragStatus.textContent = text;
   }
 
+  function beginHardwareTeaching() {
+    if (teachingPlayback) {
+      updateTeachingStatus(t('sim.replayBusy'));
+      return false;
+    }
+    stopPath();
+    moveStart = 0;
+    gripperMotion = null;
+    teachingRecording = true;
+    teachingSource = 'hardware';
+    teachingMode = els.teachHardwareMode && els.teachHardwareMode.value === 'endpoint'
+      ? 'endpoint'
+      : 'path';
+    teachingWaypoints = [];
+    hardwareTeachOriginNs = null;
+    hardwareTeachFallbackStart = performance.now();
+    hardwareTeachLastStatusAt = 0;
+    if (els.teachExportText) els.teachExportText.value = '';
+    updateTeachingStatus();
+    return true;
+  }
+
+  function appendHardwareTeachingSample(joints, stamp, gripperPosition) {
+    if (!teachingRecording || teachingSource !== 'hardware') return false;
+    const sample = {};
+    IKSolver.jointNames.forEach((name) => {
+      const value = Number(joints && joints[name]);
+      if (Number.isFinite(value)) sample[name] = value;
+    });
+    if (Object.keys(sample).length !== IKSolver.jointNames.length) return false;
+    const gripper = gripperPosition == null ? NaN : Number(gripperPosition);
+    if (Number.isFinite(gripper)) sample.gripper = clamp(gripper, 0, 0.1);
+
+    const fallbackElapsedMs = Math.max(0, performance.now() - hardwareTeachFallbackStart);
+    const stampNs = rosStampToNs(stamp);
+    let elapsedMs = fallbackElapsedMs;
+    let rosStamp = null;
+    if (stampNs !== null) {
+      if (hardwareTeachOriginNs === null) hardwareTeachOriginNs = stampNs;
+      const deltaNs = stampNs - hardwareTeachOriginNs;
+      if (deltaNs >= 0n) {
+        const stampElapsedMs = nanosecondsToMilliseconds(deltaNs);
+        const allowedClockDriftMs = Math.max(250, fallbackElapsedMs * 0.25);
+        // Prefer the source timestamp, but fall back to the browser's monotonic
+        // clock if malformed/stale ROS stamps would compress the recording.
+        if (Math.abs(stampElapsedMs - fallbackElapsedMs) <= allowedClockDriftMs) {
+          elapsedMs = stampElapsedMs;
+          rosStamp = nsToRosStamp(stampNs);
+        }
+      }
+    }
+
+    const point = {
+      t: elapsedMs,
+      joints: sample,
+      source: 'hardware',
+      raw: true,
+      stamp: rosStamp
+    };
+    const previous = teachingWaypoints[teachingWaypoints.length - 1];
+    const sameSourceStamp = previous
+      && rosStamp
+      && previous.stamp
+      && rosStamp.sec === previous.stamp.sec
+      && rosStamp.nanosec === previous.stamp.nanosec;
+    if (teachingMode === 'endpoint') {
+      teachingWaypoints = [point];
+    } else if (sameSourceStamp) {
+      // /joint_states and /gripper/state share the same controller stamp. The
+      // gripper callback arrives separately, so fold it into the arm sample
+      // instead of creating two trajectory points at the same instant.
+      teachingWaypoints[teachingWaypoints.length - 1] = point;
+    } else {
+      teachingWaypoints.push(point);
+    }
+
+    const now = performance.now();
+    if (now - hardwareTeachLastStatusAt >= 120) {
+      hardwareTeachLastStatusAt = now;
+      updateTeachingStatus();
+    }
+    return true;
+  }
+
+  function endHardwareTeaching() {
+    if (!teachingRecording || teachingSource !== 'hardware') return;
+    teachingRecording = false;
+    updateTeachingStatus();
+  }
+
+  function rosStampToNs(stamp) {
+    const sec = Number(stamp && stamp.sec);
+    const nanosec = Number(stamp && stamp.nanosec);
+    if (!Number.isInteger(sec) || !Number.isInteger(nanosec) || sec < 0 || nanosec < 0 || nanosec > 999999999) return null;
+    return BigInt(sec) * 1000000000n + BigInt(nanosec);
+  }
+
+  function nsToRosStamp(ns) {
+    const sec = ns / 1000000000n;
+    const nanosec = ns % 1000000000n;
+    return { sec: Number(sec), nanosec: Number(nanosec) };
+  }
+
+  function nanosecondsToMilliseconds(ns) {
+    const wholeMilliseconds = ns / 1000000n;
+    const fractionalNanoseconds = ns % 1000000n;
+    return Number(wholeMilliseconds) + Number(fractionalNanoseconds) / 1e6;
+  }
+
   function toggleTeachingRecord() {
+    if (teachingPlayback) {
+      updateTeachingStatus(t('sim.replayBusy'));
+      return;
+    }
+    if (teachingRecording && teachingSource === 'hardware') {
+      updateTeachingStatus(t('sim.stopRecordFirst'));
+      return;
+    }
     if (teachingRecording) {
-      teachingRecording = false;
       recordTeachingWaypoint(true);
+      teachingRecording = false;
     } else {
       teachingWaypoints = [];
+      teachingSource = 'web';
+      teachingMode = 'path';
+      hardwareTeachOriginNs = null;
       teachingStart = performance.now();
       teachingLastSample = 0;
       teachingPlayback = null;
@@ -1420,6 +1577,7 @@ const t = window.rebotI18n ? window.rebotI18n.t : (k) => k;
     teachingWaypoints.push({
       t: Math.max(0, now - teachingStart),
       joints: { ...currentAngles },
+      source: 'web',
       tcp: { x: tcp.x, y: tcp.y, z: tcp.z },
       tcp_ros: { x: ros.x, y: ros.y, z: ros.z }
     });
@@ -1427,6 +1585,14 @@ const t = window.rebotI18n ? window.rebotI18n.t : (k) => k;
   }
 
   function replayTeaching() {
+    if (teachingPlayback) {
+      updateTeachingStatus(t('sim.replayBusy'));
+      return;
+    }
+    if (teachingRecording) {
+      updateTeachingStatus(t('sim.stopRecordFirst'));
+      return;
+    }
     if (!teachingWaypoints.length || !robot) {
       updateTeachingStatus(t('sim.noReplay'));
       return;
@@ -1434,67 +1600,350 @@ const t = window.rebotI18n ? window.rebotI18n.t : (k) => k;
     teachingRecording = false;
     stopPath();
     moveStart = 0;
-    teachingPlayback = {
-      points: teachingWaypoints.map((point) => ({ ...point, joints: { ...point.joints } })),
+    const replayPoints = prepareTeachingReplay(teachingWaypoints);
+    const playback = {
+      points: replayPoints,
       index: 0,
-      segmentStart: performance.now(),
-      segmentDuration: 260,
-      startAngles: { ...currentAngles }
+      startedAt: performance.now(),
+      startAngles: { ...currentAngles },
+      rosControlled: false,
+      feedbackDriven: false,
+      smoothed: true
     };
-    updateTeachingStatus(t('sim.replaying'));
+    teachingPlayback = playback;
+    let claimedByController = false;
+    emitCommand({
+      type: 'teaching-replay',
+      mode: teachingMode,
+      waypoints: replayPoints,
+      claim(options) {
+        claimedByController = true;
+        playback.rosControlled = true;
+        playback.feedbackDriven = Boolean(options && options.feedbackDriven);
+        updateTeachingStatus(t('msg.teachReplayClaimed'));
+      },
+      complete(success, message) {
+        if (teachingPlayback === playback && (playback.feedbackDriven || !success)) {
+          teachingPlayback = null;
+        }
+        updateTeachingStatus(message || (success ? t('msg.teachReplayDone') : t('msg.teachReplayFail')));
+      },
+      stamp: performance.now()
+    });
+    updateTeachingStatus(
+      claimedByController ? t('msg.teachReplaySyncing') : t('msg.teachReplayLocal')
+    );
+  }
+
+  function stopTeachingReplay() {
+    if (!teachingPlayback) return;
+    teachingPlayback = null;
+    updateTeachingStatus(t('sim.replayStopped'));
+  }
+
+  function prepareTeachingReplay(sourcePoints) {
+    const source = sourcePoints
+      .filter((point) => point && point.joints)
+      .map((point) => ({
+        t: Number(point.t) || 0,
+        joints: { ...point.joints },
+        tcp: point.tcp ? { ...point.tcp } : null,
+        tcp_ros: point.tcp_ros ? { ...point.tcp_ros } : null,
+        raw: Boolean(point.raw),
+        source: point.source,
+        stamp: point.stamp ? { ...point.stamp } : null,
+        time_from_start: point.time_from_start ? { ...point.time_from_start } : null
+      }));
+    if (teachingMode === 'endpoint') {
+      if (!source.length) return source;
+      const endpoint = source[source.length - 1];
+      return [{
+        ...endpoint,
+        t: TEACH_ENDPOINT_DURATION_MS,
+        stamp: null,
+        time_from_start: null
+      }];
+    }
+    if (source.length < 2) return source;
+
+    const hasRecordedGripper = source.some((point) => Number.isFinite(Number(point.joints.gripper)));
+    if (hasRecordedGripper) {
+      const firstGripper = source.find((point) => Number.isFinite(Number(point.joints.gripper))).joints.gripper;
+      let heldGripper = Number(firstGripper);
+      source.forEach((point) => {
+        const value = Number(point.joints.gripper);
+        if (Number.isFinite(value)) heldGripper = value;
+        point.joints.gripper = heldGripper;
+      });
+    }
+    const names = [
+      ...IKSolver.jointNames,
+      ...(hasRecordedGripper ? ['gripper'] : [])
+    ];
+    // Hardware feedback contains encoder quantization and timestamp jitter. Keep
+    // the exported samples raw, but normalize the replay command rate before it
+    // reaches the controller.
+    if (source.every((point) => point.raw || point.source === 'hardware')) {
+      const returnSeconds = Math.max(
+        0.15,
+        maxArmJointDelta(currentAngles, source[0].joints) / TEACH_REPLAY_RETURN_SPEED_RAD_S
+      );
+      return prepareRawTeachingReplay(source, names, returnSeconds * 1000);
+    }
+
+    const firstTime = source[0].t;
+    source.forEach((point, index) => {
+      point.t = Math.max(index ? source[index - 1].t + 1 : 0, point.t - firstTime);
+    });
+
+    // Centered smoothing removes small IK reversals while keeping the recorded
+    // start and end poses unchanged.
+    const smoothed = source.map((point, index) => {
+      if (index === 0 || index === source.length - 1) return point;
+      const joints = {};
+      names.forEach((name) => {
+        let weighted = 0;
+        let totalWeight = 0;
+        for (let offset = -2; offset <= 2; offset += 1) {
+          const sampleIndex = clamp(index + offset, 0, source.length - 1);
+          const value = Number(source[sampleIndex].joints[name]);
+          if (!Number.isFinite(value)) continue;
+          const weight = 3 - Math.abs(offset);
+          weighted += value * weight;
+          totalWeight += weight;
+        }
+        joints[name] = totalWeight ? weighted / totalWeight : Number(point.joints[name]) || 0;
+      });
+      return { ...point, joints };
+    });
+
+    const rawDurationMs = Math.max(1, smoothed[smoothed.length - 1].t);
+    const sampleIntervalMs = Math.max(
+      1000 / TEACH_REPLAY_SAMPLE_HZ,
+      rawDurationMs / Math.max(TEACH_REPLAY_MAX_POINTS - 1, 1)
+    );
+    const resampled = [];
+    let segment = 0;
+    for (let sampleTime = 0; sampleTime < rawDurationMs; sampleTime += sampleIntervalMs) {
+      while (segment < smoothed.length - 2 && smoothed[segment + 1].t < sampleTime) {
+        segment += 1;
+      }
+      resampled.push(sampleTeachingSegment(smoothed, segment, sampleTime, names));
+    }
+    resampled.push({
+      ...smoothed[smoothed.length - 1],
+      joints: { ...smoothed[smoothed.length - 1].joints },
+      rawT: rawDurationMs
+    });
+
+    const returnSeconds = Math.max(
+      0.15,
+      maxArmJointDelta(currentAngles, resampled[0].joints) / TEACH_REPLAY_RETURN_SPEED_RAD_S
+    );
+    resampled.forEach((point) => {
+      point.t = returnSeconds * 1000 + point.rawT;
+    });
+    return resampled.map(({ rawT, ...point }) => point);
+  }
+
+  function prepareRawTeachingReplay(source, names, leadMs) {
+    const firstTime = source[0].t;
+    source.forEach((point, index) => {
+      point.t = Math.max(index ? source[index - 1].t : 0, point.t - firstTime);
+    });
+
+    const durationMs = Math.max(1, source[source.length - 1].t);
+    const sampleIntervalMs = Math.max(
+      1000 / TEACH_REPLAY_SAMPLE_HZ,
+      durationMs / Math.max(TEACH_REPLAY_MAX_POINTS - 1, 1)
+    );
+    const resampled = [];
+    let segment = 0;
+    for (let sampleTime = 0; sampleTime < durationMs; sampleTime += sampleIntervalMs) {
+      while (segment < source.length - 2 && source[segment + 1].t < sampleTime) {
+        segment += 1;
+      }
+      resampled.push(interpolateTeachingPoint(source, segment, sampleTime, names));
+    }
+    resampled.push({
+      ...source[source.length - 1],
+      t: durationMs,
+      joints: { ...source[source.length - 1].joints },
+      raw: false,
+      stamp: null,
+      time_from_start: null
+    });
+
+    const smoothed = resampled.map((point, index) => {
+      if (index === 0 || index === resampled.length - 1) return point;
+      const joints = {};
+      names.forEach((name) => {
+        let weighted = 0;
+        let totalWeight = 0;
+        for (let offset = -2; offset <= 2; offset += 1) {
+          const sampleIndex = clamp(index + offset, 0, resampled.length - 1);
+          const value = Number(resampled[sampleIndex].joints[name]);
+          if (!Number.isFinite(value)) continue;
+          const weight = 3 - Math.abs(offset);
+          weighted += value * weight;
+          totalWeight += weight;
+        }
+        joints[name] = totalWeight ? weighted / totalWeight : Number(point.joints[name]) || 0;
+      });
+      return {
+        ...point,
+        joints,
+        raw: false,
+        stamp: null,
+        time_from_start: null
+      };
+    });
+
+    return smoothed.map((point) => ({
+      ...point,
+      t: leadMs + point.t
+    }));
+  }
+
+  function interpolateTeachingPoint(points, index, sampleTime, names) {
+    const left = points[index];
+    const right = points[Math.min(points.length - 1, index + 1)];
+    const span = Math.max(1, right.t - left.t);
+    const ratio = clamp((sampleTime - left.t) / span, 0, 1);
+    const joints = {};
+    names.forEach((name) => {
+      const start = Number(left.joints[name]) || 0;
+      const end = Number(right.joints[name]) || 0;
+      joints[name] = start + (end - start) * ratio;
+    });
+    return {
+      t: sampleTime,
+      joints,
+      source: left.source,
+      raw: false,
+      stamp: null,
+      time_from_start: null
+    };
+  }
+
+  function sampleTeachingSegment(points, index, sampleTime, names) {
+    const p0 = points[Math.max(0, index - 1)];
+    const p1 = points[index];
+    const p2 = points[Math.min(points.length - 1, index + 1)];
+    const p3 = points[Math.min(points.length - 1, index + 2)];
+    const span = Math.max(1, p2.t - p1.t);
+    const u = clamp((sampleTime - p1.t) / span, 0, 1);
+    const joints = {};
+    names.forEach((name) => {
+      const v0 = Number(p0.joints[name]) || 0;
+      const v1 = Number(p1.joints[name]) || 0;
+      const v2 = Number(p2.joints[name]) || 0;
+      const v3 = Number(p3.joints[name]) || 0;
+      const u2 = u * u;
+      const u3 = u2 * u;
+      const value = 0.5 * (
+        2 * v1 +
+        (-v0 + v2) * u +
+        (2 * v0 - 5 * v1 + 4 * v2 - v3) * u2 +
+        (-v0 + 3 * v1 - 3 * v2 + v3) * u3
+      );
+      joints[name] = clamp(value, Math.min(v1, v2), Math.max(v1, v2));
+    });
+    return { t: sampleTime, rawT: sampleTime, joints };
+  }
+
+  function maxArmJointDelta(left, right) {
+    let maximum = 0;
+    jointDefs.forEach((joint) => {
+      if (joint.name === 'gripper') return;
+      const a = Number(left && left[joint.name]);
+      const b = Number(right && right[joint.name]);
+      if (Number.isFinite(a) && Number.isFinite(b)) {
+        maximum = Math.max(maximum, Math.abs(b - a));
+      }
+    });
+    return maximum;
   }
 
   function updateTeachingPlayback(now) {
     if (!teachingPlayback) return;
-    const point = teachingPlayback.points[teachingPlayback.index];
-    if (!point) {
+    const playback = teachingPlayback;
+    if (playback.feedbackDriven) return;
+    const points = playback.points;
+    if (!points.length) {
       teachingPlayback = null;
       updateTeachingStatus(t('sim.replayDone'));
       return;
     }
 
-    const u = clamp((now - teachingPlayback.segmentStart) / teachingPlayback.segmentDuration, 0, 1);
-    const eased = u < 0.5 ? 2 * u * u : 1 - Math.pow(-2 * u + 2, 2) / 2;
-    jointDefs.forEach((joint) => {
-      const start = teachingPlayback.startAngles[joint.name] ?? currentAngles[joint.name] ?? 0;
-      const end = point.joints[joint.name] ?? start;
-      setJoint(joint.name, start + (end - start) * eased, false, { source: 'teach-replay' });
-    });
+    const elapsed = Math.max(0, now - playback.startedAt);
+    while (playback.index < points.length && elapsed >= Number(points[playback.index].t || 0)) {
+      playback.index += 1;
+    }
 
-    if (u < 1) return;
-
-    teachingPlayback.index += 1;
-    if (teachingPlayback.index >= teachingPlayback.points.length) {
+    if (playback.index >= points.length) {
+      const finalPoint = points[points.length - 1];
+      jointDefs.forEach((joint) => {
+        const value = finalPoint.joints[joint.name];
+        if (Number.isFinite(Number(value))) {
+          setJoint(joint.name, Number(value), false, { source: 'teach-replay', emit: false });
+        }
+      });
       teachingPlayback = null;
       syncGhostToRobot();
       updateTeachingStatus(t('sim.replayDone'));
       return;
     }
 
-    const prev = teachingPlayback.points[teachingPlayback.index - 1];
-    const next = teachingPlayback.points[teachingPlayback.index];
-    teachingPlayback.startAngles = { ...currentAngles };
-    teachingPlayback.segmentStart = now;
-    teachingPlayback.segmentDuration = clamp(next.t - prev.t, 80, 900);
+    const right = points[playback.index];
+    const left = playback.index > 0
+      ? points[playback.index - 1]
+      : { t: 0, joints: playback.startAngles };
+    const leftTime = Math.max(0, Number(left.t) || 0);
+    const rightTime = Math.max(leftTime + 1, Number(right.t) || leftTime + 1);
+    const ratio = clamp((elapsed - leftTime) / (rightTime - leftTime), 0, 1);
+    jointDefs.forEach((joint) => {
+      const start = left.joints[joint.name] ?? currentAngles[joint.name] ?? 0;
+      const end = right.joints[joint.name] ?? start;
+      setJoint(joint.name, start + (end - start) * ratio, false, {
+        source: 'teach-replay',
+        emit: false
+      });
+    });
   }
 
   function exportTeachingWaypoints() {
+    if (teachingRecording) {
+      updateTeachingStatus(t('sim.stopRecordFirst'));
+      return;
+    }
     if (!teachingWaypoints.length) {
       updateTeachingStatus(t('sim.noExport'));
       return;
     }
-    const jointNames = jointDefs.map((joint) => joint.name);
+    const raw = teachingWaypoints.every((point) => point.raw || point.source === 'hardware');
+    const jointNames = raw ? IKSolver.jointNames : jointDefs.map((joint) => joint.name);
+    const firstStampNs = raw && teachingWaypoints[0].stamp
+      ? rosStampToNs(teachingWaypoints[0].stamp)
+      : null;
+    const gripperRecorded = teachingWaypoints.some((point) =>
+      Number.isFinite(Number(point.joints && point.joints.gripper))
+    );
     const payload = {
-      format: 'rebotarm_ros_waypoints_v1',
+      format: raw ? 'rebotarm_dm_teach_v1' : 'rebotarm_ros_waypoints_v1',
       frame_id: 'base_link',
       joint_names: jointNames,
       count: teachingWaypoints.length,
+      ...(raw ? { source: 'hardware', sample: 'raw', mode: teachingMode } : {}),
+      ...(raw ? { gripper_recorded: gripperRecorded } : {}),
+      ...(raw && teachingMode === 'endpoint' ? { duration_sec: TEACH_ENDPOINT_DURATION_MS / 1000 } : {}),
       waypoints: teachingWaypoints.map((point) => ({
-        time_from_start: {
-          sec: Math.floor(point.t / 1000),
-          nanosec: Math.round((point.t % 1000) * 1e6)
-        },
+        time_from_start: waypointRosTime(point, firstStampNs),
         positions: jointNames.map((name) => point.joints[name] ?? 0),
+        ...(Number.isFinite(Number(point.joints.gripper))
+          ? { gripper_position: Number(point.joints.gripper) }
+          : {}),
+        ...(point.stamp ? { ros_stamp: point.stamp } : {}),
         tcp_ros: point.tcp_ros
       }))
     };
@@ -1505,34 +1954,240 @@ const t = window.rebotI18n ? window.rebotI18n.t : (k) => k;
       els.teachExportText.select();
     }
     if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(text).catch(() => {});
+      navigator.clipboard.writeText(text).catch(() => {});
     }
+    downloadTeachJson(text);
     updateTeachingStatus(t('sim.exported', { n: teachingWaypoints.length }));
   }
 
-  function clearTeaching() {
+  function waypointRosTime(point, firstStampNs) {
+    if (point.time_from_start && validRosStamp(point.time_from_start)) {
+      return { ...point.time_from_start };
+    }
+    const stampNs = point.stamp ? rosStampToNs(point.stamp) : null;
+    if (stampNs !== null && firstStampNs !== null) {
+      return nsToRosStamp(stampNs - firstStampNs);
+    }
+    const ms = Math.max(0, Number(point.t) || 0);
+    return {
+      sec: Math.floor(ms / 1000),
+      nanosec: Math.round((ms % 1000) * 1e6)
+    };
+  }
+
+  function downloadTeachJson(text) {
+    const blob = new Blob([text], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    const now = new Date();
+    const pad = (value) => String(value).padStart(2, '0');
+    link.href = url;
+    link.download = `rebotarm-dm-teach-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  async function importTeachingFile(file) {
+    try {
+      if (teachingRecording || teachingPlayback) {
+        updateTeachingStatus(t('sim.stopRecordFirst'));
+        return;
+      }
+      importTeachingText(await file.text());
+    } catch (error) {
+      updateTeachingStatus(t('sim.importFailed', { error: error.message || error }));
+    }
+  }
+
+  function importTeachingText(text) {
+    if (teachingRecording || teachingPlayback) {
+      throw new Error(t('sim.stopRecordFirst'));
+    }
+    let payload;
+    try {
+      payload = JSON.parse(text);
+    } catch (_) {
+      throw new Error(t('msg.teachImportInvalidJson'));
+    }
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      throw new Error(t('msg.teachImportObject'));
+    }
+
+    const format = String(payload.format || '');
+    if (
+      format !== 'rebotarm_dm_teach_v1'
+      && format !== 'rebotarm_rs_teach_v1'
+      && format !== 'rebotarm_ros_waypoints_v1'
+    ) {
+      throw new Error(t('msg.teachImportFormat'));
+    }
+    const jointNames = Array.isArray(payload.joint_names) ? payload.joint_names.map(String) : [];
+    const uniqueNames = new Set(jointNames);
+    const knownNames = new Set(jointDefs.map((joint) => joint.name));
+    if (
+      !jointNames.length
+      || uniqueNames.size !== jointNames.length
+      || jointNames.some((name) => !knownNames.has(name))
+      || IKSolver.jointNames.some((name) => !uniqueNames.has(name))
+    ) {
+      throw new Error(t('msg.teachImportJoints'));
+    }
+
+    const sourcePoints = Array.isArray(payload.waypoints) ? payload.waypoints : [];
+    const importedMode = payload.mode === 'endpoint' ? 'endpoint' : 'path';
+    const minimumPoints = importedMode === 'endpoint' ? 1 : 2;
+    if (
+      (Number.isInteger(payload.count) && payload.count !== sourcePoints.length)
+      || sourcePoints.length < minimumPoints
+    ) {
+      throw new Error(t('msg.teachImportCount'));
+    }
+
+    const raw = payload.sample === 'raw' || payload.source === 'hardware';
+    const stampsSupplied = sourcePoints.map((point) => Boolean(point && point.ros_stamp != null));
+    if (stampsSupplied.some(Boolean) && !stampsSupplied.every(Boolean)) {
+      throw new Error(t('msg.teachImportStampsPartial'));
+    }
+    let firstStampNs = null;
+    let previousStampNs = null;
+    const points = [];
+    sourcePoints.forEach((sourcePoint, index) => {
+      const positions = Array.isArray(sourcePoint.positions) ? sourcePoint.positions : [];
+      if (positions.length !== jointNames.length) {
+        throw new Error(t('msg.teachImportPositions', { index: index + 1 }));
+      }
+      const joints = {};
+      jointNames.forEach((name, jointIndex) => {
+        const value = positions[jointIndex];
+        if (typeof value !== 'number' || !Number.isFinite(value)) {
+          throw new Error(t('msg.teachImportValue', { index: index + 1 }));
+        }
+        joints[name] = value;
+      });
+      if (sourcePoint.gripper_position != null) {
+        const gripperPosition = sourcePoint.gripper_position;
+        if (
+          typeof gripperPosition !== 'number'
+          || !Number.isFinite(gripperPosition)
+          || gripperPosition < 0
+          || gripperPosition > 0.1
+        ) {
+          throw new Error(t('msg.teachImportValue', { index: index + 1 }));
+        }
+        joints.gripper = gripperPosition;
+      }
+
+      if (sourcePoint.ros_stamp != null && !validRosStamp(sourcePoint.ros_stamp)) {
+        throw new Error(t('msg.teachImportStamp', { index: index + 1 }));
+      }
+      const stamp = sourcePoint.ros_stamp != null ? sourcePoint.ros_stamp : null;
+      if (!validRosStamp(sourcePoint.time_from_start)) {
+        throw new Error(t('msg.teachImportTime', { index: index + 1 }));
+      }
+      const time = sourcePoint.time_from_start;
+      const timeNs = rosStampToNs(time);
+      const stampNs = stamp ? rosStampToNs(stamp) : null;
+      if (stampNs !== null) {
+        if (previousStampNs !== null && stampNs <= previousStampNs) {
+          throw new Error(t('msg.teachImportStampOrder'));
+        }
+        if (firstStampNs === null) firstStampNs = stampNs;
+        const relativeNs = stampNs - firstStampNs;
+        if (relativeNs !== timeNs) {
+          throw new Error(t('msg.teachImportStampMismatch', { index: index + 1 }));
+        }
+        previousStampNs = stampNs;
+      }
+      const elapsedMs = rosStampToMs(time);
+      if (index && elapsedMs <= points[index - 1].t) {
+        throw new Error(t('msg.teachImportTimeOrder'));
+      }
+      points.push({
+        t: elapsedMs,
+        joints,
+        source: raw ? 'hardware' : 'import',
+        raw,
+        stamp,
+        time_from_start: { ...time }
+      });
+    });
+
     teachingRecording = false;
     teachingPlayback = null;
+    teachingWaypoints = points;
+    teachingSource = raw ? 'hardware' : 'import';
+    teachingMode = importedMode;
+    if (els.teachHardwareMode) els.teachHardwareMode.value = teachingMode;
+    hardwareTeachOriginNs = null;
+    if (els.teachExportText) els.teachExportText.value = text;
+    updateTeachingStatus(t('sim.imported', { n: points.length }));
+  }
+
+  function validRosStamp(stamp) {
+    return Boolean(stamp) && rosStampToNs(stamp) !== null;
+  }
+
+  function rosStampToMs(stamp) {
+    const ns = rosStampToNs(stamp);
+    if (ns === null) throw new Error(t('msg.teachImportTime', { index: 1 }));
+    return Number(ns / 1000000n);
+  }
+
+  function clearTeaching() {
+    if (teachingRecording || teachingPlayback) {
+      updateTeachingStatus(t('sim.stopRecordFirst'));
+      return;
+    }
+    teachingPlayback = null;
     teachingWaypoints = [];
+    teachingSource = 'web';
+    teachingMode = 'path';
+    hardwareTeachOriginNs = null;
     if (els.teachExportText) els.teachExportText.value = '';
     updateTeachingStatus();
   }
 
   function updateTeachingStatus(message) {
+    const replayActive = Boolean(teachingPlayback);
+    if (els.teachRecord) els.teachRecord.disabled = replayActive;
     if (els.teachRecord) {
       els.teachRecord.textContent = teachingRecording ? t('sim.stopRecord') : t('teach.record');
       els.teachRecord.classList.toggle('active', teachingRecording);
     }
+    if (els.teachHardwareRecord) {
+      els.teachHardwareRecord.textContent = teachingRecording && teachingSource === 'hardware'
+        ? t('sim.stopHardwareRecord')
+        : t('teach.hardwareRecord');
+      els.teachHardwareRecord.classList.toggle('active', teachingRecording && teachingSource === 'hardware');
+    }
+    if (els.teachImport) els.teachImport.disabled = replayActive || teachingRecording;
+    if (els.teachClear) els.teachClear.disabled = replayActive || teachingRecording;
+    if (els.teachReplay) els.teachReplay.disabled = replayActive || teachingRecording;
+    if (els.teachHardwareMode) els.teachHardwareMode.disabled = replayActive || teachingRecording;
     if (!els.teachStatus) return;
     if (message) {
       els.teachStatus.textContent = message;
     } else if (teachingRecording) {
-      els.teachStatus.textContent = t('sim.recording', { n: teachingWaypoints.length });
+      els.teachStatus.textContent = teachingSource === 'hardware' && teachingMode === 'endpoint'
+        ? t('sim.hardwareEndpointRecording')
+        : teachingSource === 'hardware'
+        ? t('sim.hardwareRecording', {
+          n: teachingWaypoints.length,
+          sec: (teachingWaypoints.length ? teachingWaypoints[teachingWaypoints.length - 1].t / 1000 : 0).toFixed(3)
+        })
+        : t('sim.recording', { n: teachingWaypoints.length });
     } else if (teachingPlayback) {
-      els.teachStatus.textContent = t('sim.replaying');
+      els.teachStatus.textContent = t('msg.teachReplayLocal');
     } else if (teachingWaypoints.length) {
       const duration = teachingWaypoints[teachingWaypoints.length - 1].t / 1000;
-      els.teachStatus.textContent = t('sim.recorded', { n: teachingWaypoints.length, sec: duration.toFixed(1) });
+      const raw = teachingWaypoints.every((point) => point.raw || point.source === 'hardware');
+      els.teachStatus.textContent = raw && teachingMode === 'endpoint'
+        ? t('sim.hardwareEndpointRecorded')
+        : raw
+        ? t('sim.hardwareRecorded', { n: teachingWaypoints.length, sec: duration.toFixed(3) })
+        : t('sim.recorded', { n: teachingWaypoints.length, sec: duration.toFixed(1) });
     } else {
       els.teachStatus.textContent = t('teach.status');
     }
@@ -2138,14 +2793,39 @@ const t = window.rebotI18n ? window.rebotI18n.t : (k) => k;
       return teachingWaypoints.map((point) => ({
         ...point,
         joints: { ...point.joints },
-        tcp_ros: { ...point.tcp_ros }
+        tcp_ros: point.tcp_ros ? { ...point.tcp_ros } : null,
+        stamp: point.stamp ? { ...point.stamp } : null,
+        time_from_start: point.time_from_start ? { ...point.time_from_start } : null
       }));
+    },
+    beginHardwareTeaching() {
+      return beginHardwareTeaching();
+    },
+    appendHardwareTeachingSample(joints, stamp, gripperPosition) {
+      return appendHardwareTeachingSample(joints, stamp, gripperPosition);
+    },
+    endHardwareTeaching() {
+      endHardwareTeaching();
+    },
+    isTeachingReplayActive() {
+      return Boolean(teachingPlayback);
+    },
+    stopTeachingReplay() {
+      stopTeachingReplay();
+    },
+    importTeachingText(text) {
+      importTeachingText(text);
     },
     setAngles(angles, options) {
       if (!angles || typeof angles !== 'object') return;
     const source = options && options.source ? options.source : 'api';
     const isFeedback = source === 'ros' || source === 'mujoco-physics';
-      if (isFeedback && (teachingPlayback || moveStart || animation || draggingTcp || dragSettling || gripperMotion)) return;
+      const forceFeedback = Boolean(options && options.forceFeedback);
+      if (
+        isFeedback &&
+        !forceFeedback &&
+        (teachingPlayback || moveStart || animation || draggingTcp || dragSettling || gripperMotion)
+      ) return;
       if (!isFeedback) {
         stopPath();
         teachingPlayback = null;
@@ -2159,7 +2839,12 @@ const t = window.rebotI18n ? window.rebotI18n.t : (k) => k;
     setGripperWidth(widthM, options) {
       const source = options && options.source ? options.source : 'api';
       const isFeedback = source === 'ros' || source === 'mujoco-physics';
-      if (isFeedback && (teachingPlayback || moveStart || animation || draggingTcp || dragSettling || gripperMotion)) return;
+      const forceFeedback = Boolean(options && options.forceFeedback);
+      if (
+        isFeedback &&
+        !forceFeedback &&
+        (teachingPlayback || moveStart || animation || draggingTcp || dragSettling || gripperMotion)
+      ) return;
       if (!isFeedback) {
         stopPath();
         teachingPlayback = null;

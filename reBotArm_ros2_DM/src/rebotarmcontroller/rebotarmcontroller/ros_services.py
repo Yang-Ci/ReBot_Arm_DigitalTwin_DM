@@ -9,10 +9,17 @@ from .conversions import pose_to_xyz_rpy
 
 
 class ArmServices:
-    def __init__(self, node, hardware, namespace: str) -> None:
+    def __init__(
+        self,
+        node,
+        hardware,
+        namespace: str,
+        safe_home_max_vel: float = 0.8,
+    ) -> None:
         self._node = node
         self._hardware = hardware
         self._namespace = namespace
+        self._safe_home_max_vel = float(safe_home_max_vel)
 
         node.create_service(
             Trigger,
@@ -74,6 +81,30 @@ class ArmServices:
             self.set_gripper,
             callback_group=node.reentrant_group,
         )
+        node.create_service(
+            Trigger,
+            self._service("gripper/release"),
+            self.release_gripper,
+            callback_group=node.slow_group,
+        )
+        node.create_service(
+            Trigger,
+            self._service("gripper/hold"),
+            self.hold_gripper,
+            callback_group=node.slow_group,
+        )
+        node.create_service(
+            Trigger,
+            self._service("gripper/assist/start"),
+            self.start_gripper_assist,
+            callback_group=node.slow_group,
+        )
+        node.create_service(
+            Trigger,
+            self._service("gripper/assist/status"),
+            self.gripper_assist_status,
+            callback_group=node.reentrant_group,
+        )
 
     def _service(self, name: str) -> str:
         return f"/{self._namespace}/{name}"
@@ -104,7 +135,7 @@ class ArmServices:
         try:
             self._hardware.stop_gravity_compensation()
             self._hardware.ensure_pos_vel_control()
-            self._hardware.safe_home()
+            self._hardware.safe_home(max_vel=self._safe_home_max_vel)
             response.success = True
             response.message = "safe_home complete"
         except Exception as exc:
@@ -134,7 +165,7 @@ class ArmServices:
             else:
                 self._node.get_logger().info("gravity compensation started")
             response.success = True
-            response.message = "gravity compensation started"
+            response.message = "gravity compensation started; gripper assist active"
         except Exception as exc:
             response.success = False
             response.message = str(exc)
@@ -241,4 +272,55 @@ class ArmServices:
             response.reached_position = 0.0
             self._node.get_logger().error(f"gripper set failed: {exc}")
         self._node.publish_arm_status()
+        return response
+
+    def release_gripper(self, _request, response):
+        try:
+            self._hardware.release_gripper_for_manual()
+            response.success = True
+            response.message = "gripper released for manual movement"
+            self._node.get_logger().info(response.message)
+        except Exception as exc:
+            response.success = False
+            response.message = str(exc)
+            self._node.get_logger().error(f"gripper release failed: {exc}")
+        self._node.publish_arm_status()
+        return response
+
+    def hold_gripper(self, _request, response):
+        try:
+            self._hardware.hold_gripper_current()
+            response.success = True
+            response.message = "gripper holding current position"
+            self._node.get_logger().info(response.message)
+        except Exception as exc:
+            response.success = False
+            response.message = str(exc)
+            self._node.get_logger().error(f"gripper hold failed: {exc}")
+        self._node.publish_arm_status()
+        return response
+
+    def start_gripper_assist(self, _request, response):
+        try:
+            self._hardware.start_gripper_assist()
+            response.success = True
+            response.message = "gripper low-resistance assist active"
+            self._node.get_logger().warn(
+                "gripper low-resistance assist active; keep hands clear of pinch points"
+            )
+        except Exception as exc:
+            response.success = False
+            response.message = str(exc)
+            self._node.get_logger().error(f"gripper assist start failed: {exc}")
+        self._node.publish_arm_status()
+        return response
+
+    def gripper_assist_status(self, _request, response):
+        active = self._hardware.gripper_assist_active()
+        response.success = bool(active)
+        response.message = (
+            "gripper low-resistance assist active"
+            if active
+            else "gripper low-resistance assist inactive"
+        )
         return response

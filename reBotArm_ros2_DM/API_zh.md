@@ -30,6 +30,10 @@
 | Service | `/rebotarm/set_zero` | `rebotarm_msgs/srv/SetZero` | 设置关节零点 |
 | Service | `/rebotarm/move_to_pose_ik` | `rebotarm_msgs/srv/MoveToPoseIK` | IK 预检查和目标关节角求解 |
 | Service | `/rebotarm/gripper/set` | `rebotarm_msgs/srv/SetGripper` | 设置夹爪电机位置 |
+| Service | `/rebotarm/gripper/release` | `std_srvs/srv/Trigger` | 只释放夹爪电机，允许手动调整开口 |
+| Service | `/rebotarm/gripper/hold` | `std_srvs/srv/Trigger` | 从反馈当前位置恢复夹爪保持 |
+| Service | `/rebotarm/gripper/assist/start` | `std_srvs/srv/Trigger` | 启动有速度和限位保护的低阻助力 |
+| Service | `/rebotarm/gripper/assist/status` | `std_srvs/srv/Trigger` | 查询低阻助力状态 |
 | Service | `/rebotarm/gripper/open` | `rebotarm_msgs/srv/GripperCommand` | 打开夹爪到指定或默认位置 |
 | Service | `/rebotarm/gripper/close` | `rebotarm_msgs/srv/GripperCommand` | 闭合夹爪到指定或默认位置 |
 | Service | `/rebotarm/gravity_compensation/start` | `std_srvs/srv/Trigger` | 启动 controller 内部重力补偿 |
@@ -263,8 +267,11 @@ ros2 service call /rebotarm/disable std_srvs/srv/Trigger
 std_srvs/srv/Trigger
 ```
 
-说明：调用前会先停止重力补偿；如果夹爪已初始化，会先闭合夹爪到 `0.0rad`，
-然后切回 `pos_vel` 控制并调用 SDK `RebotArmEndPose.safe_home()`，让机械臂以安全速度回零。
+说明：调用前会先停止重力补偿并切回 `pos_vel` 控制，然后调用 SDK
+`RebotArmEndPose.safe_home()` 让机械臂以安全速度回零。夹爪使用独立控制循环，
+`safe_home` 会保持夹爪当前状态；需要闭合时应在回零后显式发送夹爪命令。
+默认最大关节速度由 `safe_home_max_vel` 参数控制，默认 `0.8rad/s`，允许范围为
+`0.1`～`1.5rad/s`。
 
 示例：
 
@@ -364,29 +371,56 @@ ros2 service call /rebotarm/move_to_pose_ik rebotarm_msgs/srv/MoveToPoseIK \
 rebotarm_msgs/srv/SetGripper
 ```
 
-说明：设置夹爪电机位置。ROS 层直接调用 SDK `Gripper.pos_vel()`，因此这里沿用
-SDK 夹爪电机角度单位 rad，不再做开口距离到电机角度的二次映射。
+说明：设置夹爪开口距离。ROS 层会把 `0.0`～`0.1m` 的开口距离映射为夹爪电机角度。
 
 请求：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `position` | `float64` | 目标夹爪电机位置，rad |
-| `max_effort` | `float64` | 预留字段；当前 POS_VEL 控制不使用 |
+| `position` | `float64` | 目标夹爪开口距离，m，范围 `0.0`～`0.1` |
+| `max_effort` | `float64` | 最大夹持力；小于等于 `0.0` 时使用默认值 |
 
 响应：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `success` | `bool` | 是否到达目标 |
-| `reached_position` | `float64` | 实际夹爪电机位置，rad |
+| `reached_position` | `float64` | 实际夹爪开口距离，m |
 
 示例：
 
 ```bash
 ros2 service call /rebotarm/gripper/set rebotarm_msgs/srv/SetGripper \
-  "{position: -5.0, max_effort: 0.0}"
+  "{position: 0.1, max_effort: 0.0}"
 ```
+
+### `/rebotarm/gripper/release` 与 `/rebotarm/gripper/hold`
+
+类型均为：
+
+```text
+std_srvs/srv/Trigger
+```
+
+`release` 只失能夹爪电机，不影响六个机械臂关节，可用于真机示教时用手调整夹爪。
+`hold` 会先读取夹爪当前位置，再使能夹爪并从该位置进入 `POS_VEL` 保持，避免恢复时跳回旧目标。
+启动重力补偿时会自动进入低阻助力模式，停止重力补偿时会自动执行 `hold`。发送新的夹爪电动位置命令也会自动退出低阻助力或手动释放状态。
+
+### `/rebotarm/gripper/assist/start` 与 `/rebotarm/gripper/assist/status`
+
+类型均为 `std_srvs/srv/Trigger`。`start` 将夹爪切入受限 MIT 助力模式：静止时前馈力矩为零，手动运动超过速度阈值后平滑增加同向助力，接近机械行程两端或超过速度上限时撤掉助力。`status` 的 `success=true` 表示助力正在运行。
+
+安全相关参数：
+
+| 参数 | 默认值 | 说明 |
+|---|---:|---|
+| `gripper_assist_torque` | `0.02` | 最大电机侧助力力矩，N·m；代码硬上限 `0.08` |
+| `gripper_assist_kd` | `0.015` | MIT 速度阻尼 |
+| `gripper_assist_velocity_threshold` | `0.08` | 开始助力的速度阈值，rad/s |
+| `gripper_assist_velocity_full` | `0.35` | 达到最大助力的速度，rad/s |
+| `gripper_assist_speed_limit` | `0.8` | 撤掉前馈助力的速度上限，rad/s |
+
+任何夹爪位置、MIT 或速度命令都会退出助力模式。调用 `/gripper/release` 会以失能方式退出；调用 `/gripper/hold` 或停止重力补偿会从当前位置恢复位置保持。
 
 ### `/rebotarm/gripper/open`
 
@@ -844,7 +878,7 @@ ros2 service call /rebotarm/disable std_srvs/srv/Trigger
 - `/follow_joint_trajectory` 按 point 的 `time_from_start` 执行多点关节轨迹。
 - `/move_to_pose` 更适合应用层“到达某个末端位姿”的常规使用。
 - 重力补偿必须在 controller 内部运行；不要在外部 ROS 节点用 `/joint_states` + raw command 重写高频闭环。
-- `/safe_home` 会先闭合夹爪再执行机械臂安全回零；`reBotArmController` 退出时默认也走同一流程。
+- `/safe_home` 只执行机械臂安全回零并保持夹爪当前状态；需要闭合夹爪时应显式发送夹爪命令。
 - 夹爪 `open` / `close` service 是位置控制接口，不包含力反馈夹取判断。
 - 多机械臂场景中，`arm_namespace` 只解决 ROS graph 命名冲突；TF frame 仍需额外规划 frame 前缀或 URDF 命名。
 - 修改 `hardware_manager.py`、`ros_services.py` 或 `ros_actions.py` 后，需要重启 `driver.launch.py` 才会加载新 controller 逻辑。

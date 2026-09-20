@@ -129,6 +129,22 @@
       });
     }
 
+    releaseGripper() {
+      return this.callService(`/${this.namespace}/gripper/release`, 'std_srvs/srv/Trigger', {});
+    }
+
+    holdGripper() {
+      return this.callService(`/${this.namespace}/gripper/hold`, 'std_srvs/srv/Trigger', {});
+    }
+
+    startGripperAssist() {
+      return this.callService(`/${this.namespace}/gripper/assist/start`, 'std_srvs/srv/Trigger', {});
+    }
+
+    gripperAssistStatus() {
+      return this.callService(`/${this.namespace}/gripper/assist/status`, 'std_srvs/srv/Trigger', {});
+    }
+
     moveToPose(pose, duration) {
       return this.sendActionGoal(`/${this.namespace}/move_to_pose`, 'rebotarm_msgs/action/MoveToPose', {
         target_pose: pose,
@@ -142,27 +158,65 @@
       });
     }
 
-    followJointTrajectory(jointNames, points) {
+    followJointTrajectory(jointNames, points, options) {
+      const expectedDuration = this._estimateTrajectoryDuration(points);
+      const frameId = options && options.profile === 'teaching-replay'
+        ? 'rebotarm_dm_teaching_replay'
+        : '';
       return this.sendActionGoal(`/${this.namespace}/follow_joint_trajectory`, 'control_msgs/action/FollowJointTrajectory', {
         trajectory: {
-          header: { stamp: { sec: 0, nanosec: 0 }, frame_id: '' },
+          header: { stamp: { sec: 0, nanosec: 0 }, frame_id: frameId },
           joint_names: jointNames,
           points
         },
         goal_tolerance: [],
         path_tolerance: [],
         goal_time_tolerance: { sec: 0, nanosec: 0 }
+      }, {
+        timeoutMs: Math.max(30000, (expectedDuration + 10) * 1000)
       });
     }
 
-    sendActionGoal(actionName, actionType, goal) {
+    cancelActionGoals(actionName) {
+      if (!this.connected) return false;
+      let cancelled = false;
+      this._pendingActions.forEach((pending, id) => {
+        if (actionName && pending.action !== actionName) return;
+        this._send({
+          op: 'cancel_action_goal',
+          id,
+          action: pending.action
+        });
+        cancelled = true;
+      });
+      return cancelled;
+    }
+
+    sendActionGoal(actionName, actionType, goal, options) {
+      const timeoutMs = Number(options && options.timeoutMs) || 30000;
       const id = this._id('action');
       return new Promise((resolve, reject) => {
         if (!this.connected) {
           reject(new Error(t('client.notConnected')));
           return;
         }
-        this._pendingActions.set(id, { resolve, reject, action: actionName });
+        const timer = window.setTimeout(() => {
+          if (this._pendingActions.has(id)) {
+            this._pendingActions.delete(id);
+            reject(new Error(t('client.actionTimeout', { sec: timeoutMs / 1000, action: actionName })));
+          }
+        }, timeoutMs);
+        this._pendingActions.set(id, {
+          resolve: (value) => {
+            window.clearTimeout(timer);
+            resolve(value);
+          },
+          reject: (error) => {
+            window.clearTimeout(timer);
+            reject(error);
+          },
+          action: actionName
+        });
         this._send({
           op: 'send_action_goal',
           id,
@@ -184,6 +238,15 @@
 
     getRosActionServers() {
       return this.callService('/rosapi/action_servers', 'rosapi_msgs/srv/GetActionServers', {});
+    }
+
+    _estimateTrajectoryDuration(points) {
+      return (Array.isArray(points) ? points : []).reduce((maximum, point) => {
+        const time = point && point.time_from_start;
+        const seconds = Number(time && time.sec ? time.sec : 0)
+          + Number(time && time.nanosec ? time.nanosec : 0) * 1e-9;
+        return Number.isFinite(seconds) ? Math.max(maximum, seconds) : maximum;
+      }, 0);
     }
 
     getLastMessageAt(topic) {

@@ -18,6 +18,9 @@ _G_ARRIVE_TOL = 0.12
 _G_TAU_MAX = 1.5
 _G_DEFAULT_FORCE = 0.30
 _G_CTRL_RATE = 50.0
+_G_ASSIST_TORQUE_MAX = 0.08
+_G_ASSIST_SPEED_MAX = 1.5
+_G_ASSIST_LIMIT_MARGIN = 0.25
 _GC_DEFAULT_KP = 1.5
 _GC_DEFAULT_KD = 1.0
 _GC_DEFAULT_TAU_SCALE = 1.0
@@ -34,6 +37,11 @@ class HardwareManager:
         arm_cfg: Optional[str] = None,
         gripper_cfg: Optional[str] = None,
         channel: str = "",
+        gripper_assist_torque: float = 0.02,
+        gripper_assist_kd: float = 0.015,
+        gripper_assist_velocity_threshold: float = 0.08,
+        gripper_assist_velocity_full: float = 0.35,
+        gripper_assist_speed_limit: float = 0.8,
     ) -> None:
         self._sdk_root = self._ensure_rebot_sdk_in_syspath()
 
@@ -72,6 +80,25 @@ class HardwareManager:
         self._gripper_loop_thread: threading.Thread | None = None
         self._gripper_loop_running = False
         self._gripper_lock = threading.Lock()
+        self._gripper_manual_free = False
+        self._gripper_assist_active = False
+        self._gripper_assist_velocity = 0.0
+        self._gripper_assist_torque = float(np.clip(
+            gripper_assist_torque, 0.0, _G_ASSIST_TORQUE_MAX
+        ))
+        self._gripper_assist_kd = float(np.clip(gripper_assist_kd, 0.0, 0.2))
+        self._gripper_assist_velocity_threshold = float(np.clip(
+            gripper_assist_velocity_threshold, 0.02, 0.5
+        ))
+        self._gripper_assist_velocity_full = float(max(
+            self._gripper_assist_velocity_threshold + 0.02,
+            min(gripper_assist_velocity_full, 1.0),
+        ))
+        self._gripper_assist_speed_limit = float(np.clip(
+            gripper_assist_speed_limit,
+            self._gripper_assist_velocity_full,
+            _G_ASSIST_SPEED_MAX,
+        ))
 
         self._endpos_ctrl = RebotArmEndPose(self._arm, arm_control_mode="posvel")
         # Wrapper manages gripper via its own safety loop; stop the SDK
@@ -393,16 +420,13 @@ class HardwareManager:
         else:
             self.hold_current_position()
 
-    def safe_home(self) -> None:
-        """Home the arm joints and the gripper to their zero positions.
+    def safe_home(self, max_vel: float = 0.5) -> None:
+        """Home the arm joints while preserving the current gripper target.
 
-        The SDK endpose controller only homes the arm joints (its gripper
-        control is disabled here via ``_has_gripper = False``), so the
-        gripper must be homed separately through this wrapper's own loop.
+        The gripper has an independent control loop. Callers that want it
+        closed must issue an explicit gripper command after the arm is home.
         """
-        self._endpos_ctrl.safe_home()
-        if self._gripper_mot is not None:
-            self.set_gripper_position(0.0)
+        self._endpos_ctrl.safe_home(max_vel=max_vel)
         self.set_state_machine("IDLE")
 
     def send_joint_motor_cmd(self, joint_name: str, cmd) -> None:
@@ -485,6 +509,12 @@ class HardwareManager:
                 self._gravity_comp_tick_guarded,
                 rate=self._arm._rate,
             )
+            # Hardware teaching should include the gripper.  Start the
+            # conservative low-resistance assist by default so the fingers are
+            # easier to position by hand while the six arm joints remain under
+            # gravity compensation.  Assist failures roll back through the
+            # startup exception path instead of leaving an ambiguous mode.
+            self.start_gripper_assist()
             self.set_state_machine("GRAVITY_COMP")
         except Exception as exc:
             self._gravity_comp_fault = f"{type(exc).__name__}: {exc}"
@@ -501,6 +531,7 @@ class HardwareManager:
 
     def stop_gravity_compensation(self) -> None:
         if not self._gravity_comp_active:
+            self.hold_gripper_current()
             return
         hold_target = (
             self._gravity_comp_q_last.copy()
@@ -516,6 +547,9 @@ class HardwareManager:
         if self._enabled:
             self._arm.arm.mode_pos_vel()
             self._start_pos_vel_loop(target=hold_target)
+        # Capture the hand-adjusted gripper position before re-enabling its
+        # position loop.  This prevents a jump back to the pre-teach target.
+        self.hold_gripper_current()
         self.set_state_machine("IDLE")
 
     def _clear_gravity_compensation_state(self, *, keep_fault: bool = False) -> None:
@@ -697,6 +731,10 @@ class HardwareManager:
             )
             self._error_codes = [f"GRAVITY_COMP_FAULT: {self._gravity_comp_fault}"]
         finally:
+            try:
+                self.hold_gripper_current()
+            except Exception:
+                pass
             self.set_state_machine("IDLE")
 
     def current_pose(self):
@@ -745,6 +783,13 @@ class HardwareManager:
     def set_gripper_target(self, position_m: float, max_effort: float = 0.0) -> None:
         if self._gripper_mot is None:
             raise RuntimeError("gripper is not initialized")
+        if self._gripper_manual_free or self._gripper_assist_active:
+            from motorbridge import Mode
+
+            self._gripper_mot.enable()
+            self._gripper_mot.ensure_mode(Mode.POS_VEL, 1000)
+            self._gripper_manual_free = False
+            self._gripper_assist_active = False
         distance = float(np.clip(position_m, 0.0, _G_MAX_DIST_M))
         target = max((distance / _G_MAX_DIST_M) * _G_ANGLE_OPEN, _G_OPEN_SOFT_LIMIT)
         effort = _G_DEFAULT_FORCE if max_effort <= 0.0 else float(max_effort)
@@ -798,6 +843,101 @@ class HardwareManager:
             target = self._gripper_target_angle
         return abs(self._gripper_pos - target) < _G_ARRIVE_TOL
 
+    def release_gripper_for_manual(self) -> None:
+        """Disable only the gripper motor so the fingers can be moved by hand."""
+        if getattr(self, "_gripper_mot", None) is None:
+            return
+        if (
+            getattr(self, "_gripper_manual_free", False)
+            and not getattr(self, "_gripper_assist_active", False)
+        ):
+            return
+        self._gripper_tick()
+        with self._gripper_lock:
+            self._gripper_active = False
+            self._gripper_assist_active = False
+            self._gripper_assist_velocity = 0.0
+        self._gripper_mot.disable()
+        self._gripper_manual_free = True
+
+    def hold_gripper_current(self) -> None:
+        """Re-enable the gripper and hold its measured position without a jump."""
+        if getattr(self, "_gripper_mot", None) is None:
+            return
+        if not (
+            getattr(self, "_gripper_manual_free", False)
+            or getattr(self, "_gripper_assist_active", False)
+        ):
+            return
+        from motorbridge import Mode
+
+        self._gripper_tick()
+        current = float(np.clip(
+            self._gripper_pos,
+            min(0.0, _G_ANGLE_OPEN),
+            max(0.0, _G_ANGLE_OPEN),
+        ))
+        self._gripper_mot.enable()
+        self._gripper_mot.ensure_mode(Mode.POS_VEL, 1000)
+        vlim = float(self._gripper_cfg.vlim) if self._gripper_cfg is not None else 3.0
+        self._gripper_mot.send_pos_vel(current, vlim)
+        with self._gripper_lock:
+            self._gripper_target_angle = current
+            self._gripper_active = True
+            self._gripper_assist_active = False
+            self._gripper_assist_velocity = 0.0
+        self._gripper_manual_free = False
+
+    def gripper_manual_free(self) -> bool:
+        return bool(getattr(self, "_gripper_manual_free", False))
+
+    def start_gripper_assist(self) -> None:
+        """Enable conservative motion-following torque assistance.
+
+        Assistance is zero at rest, ramps up only after the user has already
+        moved the gripper, and is removed near travel limits or at high speed.
+        """
+        if self._gripper_mot is None:
+            raise RuntimeError("gripper is not initialized")
+        from motorbridge import Mode
+
+        self._gripper_tick()
+        self._gripper_mot.enable()
+        self._gripper_mot.ensure_mode(Mode.MIT, 1000)
+        with self._gripper_lock:
+            self._gripper_active = False
+            self._gripper_manual_free = False
+            self._gripper_assist_velocity = 0.0
+            self._gripper_assist_active = True
+
+    def gripper_assist_active(self) -> bool:
+        return bool(getattr(self, "_gripper_assist_active", False))
+
+    def _gripper_assist_feedforward(self, position: float, velocity: float) -> float:
+        speed = abs(float(velocity))
+        if speed < self._gripper_assist_velocity_threshold:
+            return 0.0
+        if speed >= self._gripper_assist_speed_limit:
+            return 0.0
+
+        direction = 1.0 if velocity > 0.0 else -1.0
+        if position >= -_G_ASSIST_LIMIT_MARGIN and direction > 0.0:
+            return 0.0
+        if position <= _G_ANGLE_OPEN + _G_ASSIST_LIMIT_MARGIN and direction < 0.0:
+            return 0.0
+
+        ramp_span = max(
+            self._gripper_assist_velocity_full
+            - self._gripper_assist_velocity_threshold,
+            1e-6,
+        )
+        ramp = float(np.clip(
+            (speed - self._gripper_assist_velocity_threshold) / ramp_span,
+            0.0,
+            1.0,
+        ))
+        return direction * self._gripper_assist_torque * ramp
+
     def send_gripper_motor_cmd(self, cmd) -> None:
         if self._gripper_mot is None or self._gripper_cfg is None:
             raise RuntimeError("gripper is not initialized")
@@ -810,6 +950,13 @@ class HardwareManager:
         vlim = float(cmd.vlim) if cmd.use_vlim else float(self._gripper_cfg.vlim)
 
         if int(cmd.mode) == 0:
+            if self._gripper_manual_free or self._gripper_assist_active:
+                from motorbridge import Mode
+
+                self._gripper_mot.enable()
+                self._gripper_mot.ensure_mode(Mode.MIT, 1000)
+                self._gripper_manual_free = False
+                self._gripper_assist_active = False
             self._gripper_mot.send_mit(pos, vel, kp, kd, tau)
             with self._gripper_lock:
                 self._gripper_active = False
@@ -818,6 +965,13 @@ class HardwareManager:
         elif int(cmd.mode) == 2:
             if not hasattr(self._gripper_mot, "send_vel"):
                 raise RuntimeError("gripper does not support send_vel")
+            if self._gripper_manual_free or self._gripper_assist_active:
+                from motorbridge import Mode
+
+                self._gripper_mot.enable()
+                self._gripper_mot.ensure_mode(Mode.VEL, 1000)
+                self._gripper_manual_free = False
+                self._gripper_assist_active = False
             self._gripper_mot.send_vel(vel)
             with self._gripper_lock:
                 self._gripper_active = False
@@ -867,6 +1021,8 @@ class HardwareManager:
             return _locked
 
         for attr in (
+            "enable",
+            "disable",
             "send_pos_vel",
             "send_mit",
             "send_vel",
@@ -910,6 +1066,45 @@ class HardwareManager:
                 self._gripper_torque = float(st.torq)
         except Exception:
             pass
+
+        with self._gripper_lock:
+            assist_active = self._gripper_assist_active
+            if assist_active:
+                # Low-pass velocity before deciding the assist direction so
+                # encoder noise cannot chatter the feed-forward torque.
+                self._gripper_assist_velocity = (
+                    0.75 * self._gripper_assist_velocity
+                    + 0.25 * self._gripper_vel
+                )
+                assist_velocity = self._gripper_assist_velocity
+            else:
+                assist_velocity = 0.0
+        if not assist_active:
+            return
+
+        feedforward = self._gripper_assist_feedforward(
+            self._gripper_pos,
+            assist_velocity,
+        )
+        try:
+            self._gripper_mot.send_mit(
+                self._gripper_pos,
+                0.0,
+                0.0,
+                self._gripper_assist_kd,
+                feedforward,
+            )
+        except Exception:
+            # Fail passive: if active assistance cannot be refreshed, remove
+            # torque and disable only the gripper motor.
+            with self._gripper_lock:
+                self._gripper_assist_active = False
+                self._gripper_assist_velocity = 0.0
+                self._gripper_manual_free = True
+            try:
+                self._gripper_mot.disable()
+            except Exception:
+                pass
 
     def _gripper_loop(self) -> None:
         dt = 1.0 / _G_CTRL_RATE

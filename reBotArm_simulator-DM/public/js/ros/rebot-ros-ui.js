@@ -26,10 +26,13 @@ const NS = 'rebotarm';
   const VISION_VERTICAL_ALIGN_CLEARANCE_M = 0.075;
   const VISION_PREGRASP_CLEARANCE_M = 0.038;
   const VISION_MIN_VERTICAL_ALIGN_Z_M = 0.235;
-  const VISION_FIRST_LIFT_MIN_BY_COLOR_M = {
-    blue: 0.390
-  };
-  const JOINT_NAMES = ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6'];
+ const VISION_FIRST_LIFT_MIN_BY_COLOR_M = {
+   blue: 0.390
+ };
+ const TEACH_ENDPOINT_DURATION_S = 3;
+const JOINT_NAMES = ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6'];
+const FOLLOW_JOINT_TRAJECTORY_ACTION = `/${NS}/follow_joint_trajectory`;
+ const MOVE_TO_POSE_ACTION = `/${NS}/move_to_pose`;
   const REQUIRED_TOPICS = {
     jointStates: `/${NS}/joint_states`,
     physicsJointStates: `/${NS}/mujoco/physics_joint_states`,
@@ -44,6 +47,10 @@ const NS = 'rebotarm';
     gravityStart: `/${NS}/gravity_compensation/start`,
     gravityStop: `/${NS}/gravity_compensation/stop`,
     gravityStatus: `/${NS}/gravity_compensation/status`,
+    gripperRelease: `/${NS}/gripper/release`,
+    gripperHold: `/${NS}/gripper/hold`,
+    gripperAssistStart: `/${NS}/gripper/assist/start`,
+    gripperAssistStatus: `/${NS}/gripper/assist/status`,
     recordStart: `/${NS}/mujoco/record/start`,
     recordStop: `/${NS}/mujoco/record/stop`,
     recordReplay: `/${NS}/mujoco/record/replay`,
@@ -64,11 +71,15 @@ const NS = 'rebotarm';
     disable: document.getElementById('ros-disable'),
     safeHome: document.getElementById('ros-safe-home'),
     gravityStatus: document.getElementById('ros-gravity-status'),
+    gripperMode: document.getElementById('ros-gripper-mode'),
     gravityStart: document.getElementById('ros-gravity-start'),
     gravityStop: document.getElementById('ros-gravity-stop'),
     gravityQuery: document.getElementById('ros-gravity-status-query'),
    rosOpenGripper: document.getElementById('ros-open-gripper'),
    closeGripper: document.getElementById('ros-close-gripper'),
+   releaseGripper: document.getElementById('ros-release-gripper'),
+   assistGripper: document.getElementById('ros-assist-gripper'),
+   holdGripper: document.getElementById('ros-hold-gripper'),
    clearLog: document.getElementById('ros-clear-log'),
    log: document.getElementById('ros-log'),
    cameraCanvas: document.getElementById('ros-camera-canvas'),
@@ -90,7 +101,9 @@ const NS = 'rebotarm';
     poseZ: document.getElementById('ros-pose-z'),
     poseDuration: document.getElementById('ros-pose-duration'),
    checkIk: document.getElementById('ros-check-ik'),
-   stopPath: document.getElementById('stop-path')
+   stopPath: document.getElementById('stop-path'),
+   teachHardwareRecord: document.getElementById('teach-hardware-record'),
+   teachHomeGripperMode: document.getElementById('teach-home-gripper-mode')
   };
 
  if (!window.ReBotRosClient || !els.connect) return;
@@ -114,6 +127,7 @@ const NS = 'rebotarm';
   let latestPhysicsJointStateAt = 0;
   let latestGripperPosition = null;
   let latestGripperVelocity = null;
+  let latestGripperStatusCode = null;
   let latestGripperAt = 0;
   let listedTopics = new Set();
   let listedServices = new Set();
@@ -131,12 +145,27 @@ const NS = 'rebotarm';
   let visionSequenceBusy = false;
   let lastVisionOp = null;
   let safeDisconnectBusy = false;
-  let gravityCompensationActive = false;
-  let lastStatusState = null;
-  let gravityStatusSource = 'initial';
-  let gravityStatusPollInFlight = false;
+ let gravityCompensationActive = false;
+ let lastStatusState = null;
+ let gravityStatusSource = 'initial';
+ let gravityStatusPollInFlight = false;
+ let gripperAssistPollInFlight = false;
+ let latestArmEnabled = false;
+ let hardwareTeachActive = false;
+ let hardwareTeachBusy = false;
+ let hardwareTeachGravityStarted = false;
+ let hardwareTeachModeConfirmed = false;
+ let gripperAssistActive = false;
+ let teachingReplayFeedbackActive = false;
+ let activeTeachingGripperReplay = null;
+ let trajectoryBusy = false;
+ let trajectoryBusyLabel = '';
+ let trajectoryBusyPromise = null;
+ let trajectoryCancelRequested = false;
+ let lastTrajectoryCancelled = false;
+ let lastTrajectoryBusyWarnAt = 0;
 
-  client.subscribe(REQUIRED_TOPICS.jointStates, 'sensor_msgs/msg/JointState', (msg) => handleJointStates(msg, false), { throttleRate: 80 });
+ client.subscribe(REQUIRED_TOPICS.jointStates, 'sensor_msgs/msg/JointState', (msg) => handleJointStates(msg, false), { throttleRate: 0 });
   client.subscribe(REQUIRED_TOPICS.physicsJointStates, 'sensor_msgs/msg/JointState', (msg) => handleJointStates(msg, true), { throttleRate: 33 });
   client.subscribe(REQUIRED_TOPICS.gripper, 'rebotarm_msgs/msg/JointMotorState', handleGripperState, { throttleRate: 80 });
   client.subscribe(REQUIRED_TOPICS.armStatus, 'rebotarm_msgs/msg/ArmStatus', handleArmStatus, { throttleRate: 200 });
@@ -157,6 +186,7 @@ const NS = 'rebotarm';
       latestPhysicsJointStateAt = 0;
       mujocoSyncAnnounced = false;
       fakeDriverDetected = false;
+      finishHardwareTeachLocal(detail.state === 'error' ? t('msg.teachConnectionError') : t('msg.teachConnectionClosed'));
       updateGravityStatus(false, t('msg.rosNotConnected'), 'connection');
    }
     if (detail.state === 'open') {
@@ -176,37 +206,79 @@ const NS = 'rebotarm';
    client.autoReconnect = true;
     client.connect(nextUrl);
   });
-  els.disconnect.addEventListener('click', disconnectRos);
-  window.addEventListener('pagehide', () => {
+ els.disconnect.addEventListener('click', disconnectRos);
+ window.addEventListener('pagehide', () => {
     client.autoReconnect = false;
     if (client.socket) client.socket.close();
-  });
-  els.enable.addEventListener('click', () => guardedCall(() => client.enable(), t('msg.reqEnable')));
-  els.disable.addEventListener('click', () => {
-    cancelLowLevelPlayback();
-    guardedCall(() => client.disable(), t('msg.reqDisable'), true);
-  });
-  els.safeHome.addEventListener('click', () => guardedCall(() => client.safeHome(), t('msg.reqSafeHome')));
-  els.gravityStart.addEventListener('click', () => {
-    cancelLowLevelPlayback();
+ });
+ els.teachHardwareRecord?.addEventListener('click', toggleHardwareTeaching);
+ els.enable.addEventListener('click', () => guardedCall(() => client.enable(), t('msg.reqEnable')));
+ els.disable.addEventListener('click', () => {
+   void requestTrajectoryStop().finally(() => stopHardwareTeaching(true)).finally(() => {
+     simTargetAngles.clear();
+     mirrorHoldUntil.clear();
+     void guardedCall(() => client.disable(), t('msg.reqDisable'), true);
+   });
+ });
+ els.safeHome.addEventListener('click', () => { void safeHomeFromPanel(); });
+ els.gravityStart.addEventListener('click', () => {
+    if (trajectoryBusy) {
+      warnTrajectoryBusy();
+      return;
+    }
     guardedOptionalService(
       REQUIRED_SERVICES.gravityStart,
       () => client.startGravityCompensation(),
       t('msg.reqGravityStart')
     );
   });
-  els.gravityStop.addEventListener('click', () => {
-    cancelLowLevelPlayback();
-    guardedOptionalService(
+ els.gravityStop.addEventListener('click', () => {
+   void requestTrajectoryStop().finally(() => {
+   if (hardwareTeachActive) {
+     void stopHardwareTeaching(false);
+     return;
+   }
+   guardedOptionalService(
       REQUIRED_SERVICES.gravityStop,
       () => client.stopGravityCompensation(),
       t('msg.reqGravityStop'),
       true
     );
-  });
+   });
+ });
   els.gravityQuery.addEventListener('click', queryGravityCompensation);
  els.rosOpenGripper.addEventListener('click', () => sendGripper(OPEN_GRIPPER_M, { requireControl: true }));
  els.closeGripper.addEventListener('click', () => sendGripper(CLOSE_GRIPPER_M, { requireControl: true }));
+ els.releaseGripper?.addEventListener('click', async () => {
+   const result = await guardedOptionalService(
+     REQUIRED_SERVICES.gripperRelease,
+     () => client.releaseGripper(),
+     t('msg.reqGripperRelease')
+   );
+   if (result && result.success !== false) gripperAssistActive = false;
+   updateGripperModeDisplay();
+ });
+ els.assistGripper?.addEventListener('click', async () => {
+   if (!window.confirm(t('msg.gripperAssistConfirm'))) return;
+   const result = await guardedOptionalService(
+     REQUIRED_SERVICES.gripperAssistStart,
+     () => client.startGripperAssist(),
+     t('msg.reqGripperAssist')
+   );
+   if (result && result.success !== false) {
+     gripperAssistActive = true;
+     updateGripperModeDisplay();
+   }
+ });
+ els.holdGripper?.addEventListener('click', async () => {
+   const result = await guardedOptionalService(
+     REQUIRED_SERVICES.gripperHold,
+     () => client.holdGripper(),
+     t('msg.reqGripperHold')
+   );
+   if (result && result.success !== false) gripperAssistActive = false;
+   updateGripperModeDisplay();
+ });
  els.clearLog.addEventListener('click', () => { els.log.innerHTML = ''; });
   els.checkIk.addEventListener('click', checkIk);
   document.getElementById('ros-help-top')?.addEventListener('click', () => document.getElementById('ros-help-dialog')?.showModal());
@@ -230,15 +302,18 @@ const NS = 'rebotarm';
   if (els.visionPickDemo) els.visionPickDemo.addEventListener('click', runVisionPickDemo);
   if (els.visionPlaceDemo) els.visionPlaceDemo.addEventListener('click', runVisionPlaceDemo);
   if (els.stopPath) {
-    els.stopPath.addEventListener('click', () => {
-      cancelLowLevelPlayback();
-      writeLog(t('log.stopPlayback'), 'warn');
-    });
+ els.stopPath.addEventListener('click', () => {
+      void requestTrajectoryStop();
+ });
   }
 
-  els.control.addEventListener('change', () => {
-    if (els.control.checked) writeLog(t('log.controlLockOpen'), 'info');
-  });
+ els.control.addEventListener('change', () => {
+   if (els.control.checked) {
+     writeLog(t('log.controlLockOpen'), 'info');
+   } else if (hardwareTeachActive) {
+     void stopHardwareTeaching(true);
+   }
+ });
 
   waitForSimApi((sim) => sim.onCommand((command) => forwardSimCommand(command)));
 
@@ -246,6 +321,7 @@ const NS = 'rebotarm';
   updateDiagnostics();
   window.setInterval(updateDiagnostics, 1000);
   window.setInterval(pollGravityCompensationStatus, 500);
+  window.setInterval(pollGripperAssistStatus, 750);
 
   function handleJointStates(msg, isPhysicsFeedback) {
     if (!window.reBotSim || !Array.isArray(msg.name) || !Array.isArray(msg.position)) return;
@@ -272,6 +348,12 @@ const NS = 'rebotarm';
     if (!isPhysicsFeedback && Object.keys(next).length) {
       latestJointPositions = { ...(latestJointPositions || {}), ...next };
       latestJointStateAt = now;
+      const jointStamp = msg.header && msg.header.stamp ? msg.header.stamp : null;
+      const fingerOpening = Number(next.finger_left);
+      const recordedGripperPosition = Number.isFinite(fingerOpening)
+        ? fingerOpeningToGripperCommand(fingerOpening)
+        : latestGripperPosition;
+      appendHardwareTeachingFeedback(jointStamp, recordedGripperPosition);
     }
     if (!isPhysicsFeedback) updateFeedbackError(next);
 
@@ -322,7 +404,8 @@ const NS = 'rebotarm';
       if (Object.keys(mirrored).length) {
         window.reBotSim.setAngles(mirrored, {
           source: isPhysicsFeedback ? 'mujoco-physics' : 'ros',
-          emit: false
+          emit: false,
+          forceFeedback: teachingReplayFeedbackActive
         });
       }
     }
@@ -337,6 +420,11 @@ const NS = 'rebotarm';
     if (typeof msg.velocity === 'number') {
       latestGripperVelocity = msg.velocity;
     }
+    if (Number.isFinite(Number(msg.status_code))) {
+      latestGripperStatusCode = Number(msg.status_code);
+      if (latestGripperStatusCode === 0) gripperAssistActive = false;
+    }
+    updateGripperModeDisplay();
     if (els.mirror.checked && !hasFreshPhysicsJointFeedback() && window.reBotSim && typeof msg.position === 'number') {
       const holdUntil = mirrorHoldUntil.get('gripper') || 0;
       const target = simTargetAngles.get('gripper');
@@ -358,8 +446,23 @@ const NS = 'rebotarm';
     updateDiagnostics();
   }
 
+  function appendHardwareTeachingFeedback(stamp, gripperPosition) {
+    if (
+      !hardwareTeachActive
+      || !latestJointPositions
+      || !window.reBotSim
+      || typeof window.reBotSim.appendHardwareTeachingSample !== 'function'
+    ) return;
+    window.reBotSim.appendHardwareTeachingSample(
+      latestJointPositions,
+      stamp,
+      gripperPosition
+    );
+  }
+
   function handleArmStatus(msg) {
     fakeDriverDetected = String(msg && msg.mode || '').toLowerCase().startsWith('fake_');
+    latestArmEnabled = Boolean(msg && msg.enabled);
     const enabled = msg.enabled ? t('st.enabled') : t('st.disabled');
     const mode = msg.mode || 'unknown';
    const machine = msg.state_machine || 'unknown';
@@ -367,11 +470,209 @@ const NS = 'rebotarm';
    if (!visionSequenceBusy) {
       setMessage(t('fb.armStatus', {enabled, mode, machine, errors}));
    }
-    updateGravityStatus(machine === 'GRAVITY_COMP', machine, 'arm');
-    updateDiagnostics();
+   updateGravityStatus(machine === 'GRAVITY_COMP', machine, 'arm');
+   if (machine === 'GRAVITY_COMP') hardwareTeachModeConfirmed = true;
+   if (hardwareTeachActive && hardwareTeachModeConfirmed && machine !== 'GRAVITY_COMP') {
+     void stopHardwareTeaching(false);
+   }
+   updateHardwareTeachUi();
+   updateDiagnostics();
+  }
+
+  async function toggleHardwareTeaching() {
+    if (hardwareTeachBusy) return;
+    if (!hardwareTeachActive && trajectoryBusy) {
+      warnTrajectoryBusy();
+      return;
+    }
+    if (hardwareTeachActive) {
+      await stopHardwareTeaching(true, { returnHome: true });
+      return;
+    }
+    await startHardwareTeaching();
+  }
+
+  async function startHardwareTeaching() {
+    if (!client.connected) {
+      setStatus('closed', t('msg.rosNotConnected'));
+      return;
+    }
+    if (trajectoryBusy) {
+      warnTrajectoryBusy();
+      return;
+    }
+    if (
+      window.reBotSim &&
+      typeof window.reBotSim.isTeachingReplayActive === 'function' &&
+      window.reBotSim.isTeachingReplayActive()
+    ) {
+      setMessage(t('sim.replayBusy'));
+      writeLog(t('sim.replayBusy'), 'warn');
+      return;
+    }
+    if (!latestArmEnabled) {
+      setMessage(t('msg.teachArmNotEnabled'));
+      return;
+    }
+    if (!controlAllowed(true)) return;
+    if (!latestJointPositions || performance.now() - latestJointStateAt > 500) {
+      setMessage(t('msg.teachWaitFeedback'));
+      return;
+    }
+
+    hardwareTeachBusy = true;
+    hardwareTeachModeConfirmed = false;
+    updateHardwareTeachUi(t('msg.teachStart'));
+    try {
+      const result = await guardedOptionalService(
+        REQUIRED_SERVICES.gravityStart,
+        () => client.startGravityCompensation(),
+        t('msg.teachStart')
+      );
+      if (!result || result.success === false || result.accepted === false) return;
+
+      hardwareTeachActive = true;
+      hardwareTeachGravityStarted = true;
+      if (!els.mirror.checked) els.mirror.checked = true;
+      if (window.reBotSim && typeof window.reBotSim.beginHardwareTeaching === 'function') {
+        if (!window.reBotSim.beginHardwareTeaching()) {
+          window.reBotSim.stopTeachingReplay();
+          await stopHardwareTeaching(true, { returnHome: false });
+          return;
+        }
+      }
+      writeLog(t('msg.teachMode'), 'ok');
+    } finally {
+      hardwareTeachBusy = false;
+      updateHardwareTeachUi();
+    }
+  }
+
+  async function stopHardwareTeaching(stopGravity, options) {
+    if (!hardwareTeachActive) return;
+    hardwareTeachActive = false;
+    hardwareTeachModeConfirmed = false;
+    teachingReplayFeedbackActive = false;
+    if (window.reBotSim && typeof window.reBotSim.endHardwareTeaching === 'function') {
+      window.reBotSim.endHardwareTeaching();
+    }
+
+    const shouldStopGravity = Boolean(stopGravity) && hardwareTeachGravityStarted && client.connected;
+    const shouldReturnHome = Boolean(options && options.returnHome) && client.connected;
+    const shouldCloseGripperAfterHome = shouldReturnHome
+      && els.teachHomeGripperMode
+      && els.teachHomeGripperMode.value === 'close';
+    hardwareTeachGravityStarted = false;
+    hardwareTeachBusy = shouldStopGravity || shouldReturnHome;
+    updateHardwareTeachUi(shouldReturnHome ? t('sim.hardwareTeachHoming') : undefined);
+    writeLog(t('msg.teachRecordStopped'), 'info');
+    try {
+      if (shouldReturnHome) {
+        // safe_home exits gravity compensation and changes to POS_VEL on the
+        // controller. Avoid a redundant service round trip before homing.
+        await requestTrajectoryStop();
+        simTargetAngles.clear();
+        mirrorHoldUntil.clear();
+        const homeResult = await guardedCall(
+          () => client.safeHome(),
+          t('msg.teachSafeHome'),
+          true,
+          { keepConnectionStatus: true }
+        );
+        simTargetAngles.clear();
+        mirrorHoldUntil.clear();
+        if (
+          shouldCloseGripperAfterHome
+          && homeResult
+          && homeResult.success !== false
+          && client.connected
+        ) {
+          await commandGripperAndWait(
+            CLOSE_GRIPPER_M,
+            t('msg.teachCloseGripper'),
+            { minWaitMs: 350, requireReached: false }
+          );
+        }
+      } else if (shouldStopGravity) {
+        const result = await guardedCall(
+          () => client.stopGravityCompensation(),
+          t('msg.reqGravityStop'),
+          true,
+          { keepConnectionStatus: true }
+        );
+        if (!result || result.success === false || result.accepted === false) return;
+      }
+    } finally {
+      hardwareTeachBusy = false;
+      updateHardwareTeachUi();
+    }
+  }
+
+  async function safeHomeFromPanel() {
+    await requestTrajectoryStop();
+    await stopHardwareTeaching(true);
+    simTargetAngles.clear();
+    mirrorHoldUntil.clear();
+    const result = await guardedCall(
+      () => client.safeHome(),
+      t('msg.reqSafeHome')
+    );
+    if (!result || result.success === false || !client.connected) return;
+    await commandGripperAndWait(
+      CLOSE_GRIPPER_M,
+      t('msg.safeHomeCloseGripper'),
+      { minWaitMs: 350, requireReached: false }
+    );
+  }
+
+  function finishHardwareTeachLocal(message) {
+    if (!hardwareTeachActive) return;
+    hardwareTeachActive = false;
+    hardwareTeachGravityStarted = false;
+    hardwareTeachModeConfirmed = false;
+    teachingReplayFeedbackActive = false;
+    if (window.reBotSim && typeof window.reBotSim.endHardwareTeaching === 'function') {
+      window.reBotSim.endHardwareTeaching();
+    }
+    updateHardwareTeachUi();
+    writeLog(message || t('msg.teachRecordStopped'), 'warn');
+  }
+
+  function updateHardwareTeachUi(busyText) {
+    if (!els.teachHardwareRecord) return;
+    els.teachHardwareRecord.disabled = hardwareTeachBusy
+      || (!hardwareTeachActive && trajectoryBusy);
+    if (els.teachHomeGripperMode) {
+      els.teachHomeGripperMode.disabled = hardwareTeachBusy || hardwareTeachActive;
+    }
+    els.teachHardwareRecord.classList.toggle('active', hardwareTeachActive);
+    els.teachHardwareRecord.textContent = hardwareTeachActive
+      ? t('sim.stopHardwareRecord')
+      : (busyText || t('teach.hardwareRecord'));
   }
 
   function forwardSimCommand(command) {
+    const isGripperCommand = command
+      && command.type === 'joint'
+      && command.name === 'gripper';
+    if (hardwareTeachActive && !isGripperCommand) {
+      writeLog(t('msg.teachControlBlocked'), 'warn');
+      return;
+    }
+    if (command && command.type === 'teaching-replay') {
+      if (trajectoryBusy) {
+        const message = trajectoryBusyMessage();
+        writeLog(message, 'warn');
+        if (typeof command.complete === 'function') command.complete(false, message);
+        return;
+      }
+      forwardTeachingReplay(command);
+      return;
+    }
+    if (trajectoryBusy) {
+      warnTrajectoryBusy();
+      return;
+    }
     if (command && command.type === 'execute-current-pose') {
       void executeCurrentPoseCommand(command);
       return;
@@ -421,6 +722,163 @@ const NS = 'rebotarm';
     const label = command.label || t('adv.plan');
     const points = buildZeroToCurrentPosePoints(start, goal, getTrajectoryDuration());
     await sendTrajectory(points, label);
+  }
+
+  function forwardTeachingReplay(command) {
+    const waypoints = Array.isArray(command && command.waypoints)
+      ? command.waypoints.filter((point) => point && point.joints)
+      : [];
+    const endpointOnly = command && command.mode === 'endpoint';
+    if (
+      (!endpointOnly && waypoints.length < 2) ||
+      (endpointOnly && !waypoints.length)
+    ) return;
+    if (!controlAllowed(false)) {
+      writeLog(t('msg.teachNoController'), 'warn');
+      return;
+    }
+    if (trajectoryBusy) {
+      const message = trajectoryBusyMessage();
+      writeLog(message, 'warn');
+      if (typeof command.complete === 'function') command.complete(false, message);
+      return;
+    }
+
+    const finalJoints = waypoints[waypoints.length - 1].joints;
+    mirrorHoldUntil.clear();
+    Object.entries(finalJoints).forEach(([name, value]) => {
+      if (JOINT_NAMES.includes(name) && Number.isFinite(Number(value))) {
+        simTargetAngles.set(name, Number(value));
+      }
+    });
+    teachingReplayFeedbackActive = els.mirror.checked;
+    if (typeof command.claim === 'function') {
+      command.claim({ feedbackDriven: teachingReplayFeedbackActive });
+    }
+    void runTeachingReplayOnRos(command, waypoints);
+  }
+
+  async function runTeachingReplayOnRos(command, waypoints) {
+    const endpointOnly = command && command.mode === 'endpoint';
+    const lastTime = Number(waypoints[waypoints.length - 1].t) || 0;
+    const recordedDuration = endpointOnly
+      ? TEACH_ENDPOINT_DURATION_S
+      : Math.max(0.4, lastTime / 1000);
+    let points;
+    if (endpointOnly) {
+      const start = getCurrentRosPositions();
+      const finalJoints = waypoints[waypoints.length - 1].joints;
+      const goal = JOINT_NAMES.map((name, index) => {
+        const value = Number(finalJoints[name]);
+        return Number.isFinite(value) ? value : start[index];
+      });
+      points = buildSmoothJointMovePoints(start, goal, TEACH_ENDPOINT_DURATION_S);
+    } else {
+      points = buildTeachingTrajectoryPoints(waypoints);
+    }
+
+    const label = endpointOnly
+      ? t('msg.teachEndpointDone')
+      : `${t('teach.replay')} (${waypoints.length} / ${recordedDuration.toFixed(1)}s)`;
+    let success = false;
+    let message = t('msg.teachReplayFail');
+    const gripperReplay = { cancelled: false };
+    activeTeachingGripperReplay = gripperReplay;
+    let gripperTask = Promise.resolve(true);
+    try {
+      const trajectoryTask = sendTrajectory(
+        points,
+        label,
+        { profile: 'teaching-replay' }
+      );
+      gripperTask = replayTeachingGripper(waypoints, endpointOnly, gripperReplay);
+      const result = await trajectoryTask;
+      success = trajectoryResultSucceeded(result);
+      if (success) {
+        success = await gripperTask;
+      } else {
+        gripperReplay.cancelled = true;
+        await gripperTask;
+      }
+      const failureDetail = trajectoryFailureDetail(result);
+      message = success
+        ? (endpointOnly ? t('msg.teachEndpointDone') : t('msg.teachReplayDone'))
+        : (lastTrajectoryCancelled
+          ? t('msg.trajectoryStopped')
+          : `${t('msg.teachReplayFail')}${failureDetail ? `: ${failureDetail}` : ''}`);
+      if (!success && !lastTrajectoryCancelled) writeLog(message, 'error');
+    } catch (error) {
+      writeLog(`${t('msg.teachReplayFail')}: ${error && error.message ? error.message : error}`, 'error');
+    } finally {
+      gripperReplay.cancelled = true;
+      if (activeTeachingGripperReplay === gripperReplay) activeTeachingGripperReplay = null;
+      teachingReplayFeedbackActive = false;
+      simTargetAngles.clear();
+      mirrorHoldUntil.clear();
+    }
+    if (typeof command.complete === 'function') command.complete(success, message);
+  }
+
+  async function replayTeachingGripper(waypoints, endpointOnly, playback) {
+    const events = buildTeachingGripperEvents(waypoints, endpointOnly);
+    if (!events.length) return true;
+
+    const startedAt = performance.now();
+    for (const event of events) {
+      const deadline = startedAt + event.t;
+      while (performance.now() < deadline) {
+        if (
+          playback.cancelled
+          || trajectoryCancelRequested
+          || !client.connected
+          || !els.control.checked
+        ) return false;
+        await sleep(Math.min(60, deadline - performance.now()));
+      }
+      if (
+        playback.cancelled
+        || trajectoryCancelRequested
+        || !client.connected
+        || !els.control.checked
+      ) return false;
+      publishTeachingReplayGripper(event.position);
+    }
+    return true;
+  }
+
+  function buildTeachingGripperEvents(waypoints, endpointOnly) {
+    const samples = waypoints
+      .map((point) => ({
+        t: Math.max(0, Number(point.t) || 0),
+        position: Number(point.joints && point.joints.gripper)
+      }))
+      .filter((point) => Number.isFinite(point.position))
+      .map((point) => ({ ...point, position: clamp(point.position, CLOSE_GRIPPER_M, OPEN_GRIPPER_M) }));
+    if (!samples.length) return [];
+    if (endpointOnly) return [samples[samples.length - 1]];
+
+    const events = [{ ...samples[0], t: 0 }];
+    let last = events[0];
+    samples.slice(1, -1).forEach((sample) => {
+      if (Math.abs(sample.position - last.position) >= 0.0015 || sample.t - last.t >= 180) {
+        events.push(sample);
+        last = sample;
+      }
+    });
+    const finalSample = samples[samples.length - 1];
+    if (
+      finalSample.t > last.t
+      || Math.abs(finalSample.position - last.position) >= 0.0005
+    ) events.push(finalSample);
+    return events;
+  }
+
+  function publishTeachingReplayGripper(position) {
+    gripperAssistActive = false;
+    client.publishGripperCommand(position);
+    simTargetAngles.set('gripper', position);
+    mirrorHoldUntil.set('gripper', performance.now() + 500);
+    syncSimGripper(position);
   }
 
   function buildZeroToCurrentPosePoints(start, goal, segmentDuration) {
@@ -482,14 +940,14 @@ const NS = 'rebotarm';
 
   async function checkIk() {
     if (!controlAllowed(true)) return;
+    if (trajectoryBusy) {
+      warnTrajectoryBusy();
+      return;
+    }
     const pose = readPose();
     const duration = getPoseDuration();
     client.publishTargetPose(pose);
-    await guardedCall(
-     () => client.moveToPose(pose, duration),
-      t('msg.reqIkMove', {sec: duration.toFixed(1)}),
-     true
-    );
+    await sendMoveToPose(pose, duration, t('msg.reqIkMove', {sec: duration.toFixed(1)}));
   }
 
   async function queryGravityCompensation(options) {
@@ -516,6 +974,37 @@ const NS = 'rebotarm';
     } finally {
       gravityStatusPollInFlight = false;
     }
+  }
+
+  async function pollGripperAssistStatus() {
+    if (
+      !client.connected
+      || gripperAssistPollInFlight
+      || !listedServices.has(REQUIRED_SERVICES.gripperAssistStatus)
+    ) return;
+
+    gripperAssistPollInFlight = true;
+    try {
+      const result = await client.gripperAssistStatus();
+      gripperAssistActive = Boolean(result && result.success);
+      updateGripperModeDisplay();
+    } catch (_error) {
+      // Diagnostics and connection handling report transport failures. Keep
+      // the last confirmed mode here to avoid flickering the safety label.
+    } finally {
+      gripperAssistPollInFlight = false;
+    }
+  }
+
+  function updateGripperModeDisplay() {
+    if (!els.gripperMode) return;
+    const manuallyFree = latestGripperStatusCode === 0;
+    els.gripperMode.textContent = gripperAssistActive
+      ? t('ros.gripperModeAssist')
+      : (manuallyFree ? t('ros.gripperModeFree') : t('ros.gripperModeHolding'));
+    els.gripperMode.style.color = gripperAssistActive
+      ? '#ffd27a'
+      : (manuallyFree ? '#d7fff4' : '#ffe0b0');
   }
 
   async function runDiagnostics() {
@@ -567,44 +1056,191 @@ const NS = 'rebotarm';
     return points;
   }
 
-  async function sendTrajectory(points, optimisticMessage) {
-    if (!points.length) return;
-   if (shouldUseLowLevelTrajectory()) {
+  function buildTeachingTrajectoryPoints(waypoints) {
+    // prepareTeachingReplay already includes the safety lead-in in point.t.
+    // Start from live feedback and let the controller interpolate to the first
+    // recorded pose during that lead-in; do not add it a second time here.
+    const points = [makeTrajectoryPointAtNs(getCurrentRosPositions(), 0n)];
+    let previousNs = 0n;
+    waypoints.forEach((point) => {
+      const desiredNs = millisecondsToNs(point.t);
+      const timeNs = desiredNs > previousNs ? desiredNs : previousNs + 1n;
+      points.push(makeTrajectoryPointAtNs(
+        JOINT_NAMES.map((name) => Number(point.joints[name]) || 0),
+        timeNs
+      ));
+      previousNs = timeNs;
+    });
+    return withFiniteDifferenceVelocities(points);
+  }
+
+  function trajectoryBusyMessage() {
+    return t('msg.trajectoryBusy', {label: trajectoryBusyLabel || t('log.trajectoryDefault')});
+  }
+
+  function warnTrajectoryBusy() {
+    const now = performance.now();
+    if (now - lastTrajectoryBusyWarnAt < 400) return;
+    lastTrajectoryBusyWarnAt = now;
+    const message = trajectoryBusyMessage();
+    setMessage(message);
+    writeLog(message, 'warn');
+  }
+
+  function trajectoryResultSucceeded(result) {
+    if (result === true) return true;
+    if (!result) return false;
+    if (result.success === false || result.accepted === false) return false;
+    const status = Number(result.status);
+    if (Number.isFinite(status)) return status === 3;
+    const errorCode = Number(result.error_code);
+    if (Number.isFinite(errorCode)) return errorCode === 0;
+    return true;
+  }
+
+  function trajectoryFailureDetail(result) {
+    if (!result || typeof result !== 'object') return '';
+    if (typeof result.error_string === 'string' && result.error_string.trim()) {
+      return result.error_string.trim();
+    }
+    if (typeof result.message === 'string' && result.message.trim()) {
+      return result.message.trim();
+    }
+    const errorCode = Number(result.error_code);
+    const status = Number(result.status);
+    const details = [];
+    if (Number.isFinite(errorCode)) details.push(`error_code=${errorCode}`);
+    if (Number.isFinite(status)) details.push(`status=${status}`);
+    return details.join(', ');
+  }
+
+  function requestTrajectoryStop() {
+    const simReplayActive = window.reBotSim
+      && typeof window.reBotSim.isTeachingReplayActive === 'function'
+      && window.reBotSim.isTeachingReplayActive();
+    if (!trajectoryBusy && !lowLevelPlayback && !simReplayActive) return Promise.resolve();
+
+    trajectoryCancelRequested = true;
+    if (activeTeachingGripperReplay) activeTeachingGripperReplay.cancelled = true;
+    cancelLowLevelPlayback();
+    if (simReplayActive && typeof window.reBotSim.stopTeachingReplay === 'function') {
+      window.reBotSim.stopTeachingReplay();
+    }
+    if (trajectoryBusy && client.connected && typeof client.cancelActionGoals === 'function') {
+      client.cancelActionGoals(FOLLOW_JOINT_TRAJECTORY_ACTION);
+      client.cancelActionGoals(MOVE_TO_POSE_ACTION);
+    }
+    writeLog(t('log.trajectoryStopRequested'), 'warn');
+    return trajectoryBusyPromise || Promise.resolve();
+  }
+
+  function beginTrajectoryBusy(label) {
+    if (trajectoryBusy) {
+      warnTrajectoryBusy();
+      return false;
+    }
+    trajectoryBusy = true;
+    trajectoryBusyLabel = label;
+    trajectoryCancelRequested = false;
+    lastTrajectoryCancelled = false;
+    updateHardwareTeachUi();
+    return true;
+  }
+
+  function finishTrajectoryBusy() {
+    lastTrajectoryCancelled = trajectoryCancelRequested;
+    trajectoryBusy = false;
+    trajectoryBusyLabel = '';
+    trajectoryCancelRequested = false;
+    trajectoryBusyPromise = null;
+    updateHardwareTeachUi();
+  }
+
+  async function sendMoveToPose(pose, duration, label) {
+    if (!beginTrajectoryBusy(label)) return null;
+    trajectoryBusyPromise = guardedCall(
+      () => client.moveToPose(pose, duration),
+      label,
+      true
+    ).finally(finishTrajectoryBusy);
+    return trajectoryBusyPromise;
+  }
+
+  async function sendTrajectory(points, optimisticMessage, options) {
+    if (!points.length) return false;
+    if (!beginTrajectoryBusy(optimisticMessage || t('log.trajectoryDefault'))) return false;
+
+    const label = optimisticMessage || t('log.trajectoryDefault');
+    const execution = runTrajectory(points, label, options);
+    trajectoryBusyPromise = execution.finally(finishTrajectoryBusy);
+    return trajectoryBusyPromise;
+  }
+
+  async function runTrajectory(points, optimisticMessage, options) {
+    const simulationTaskServerDetected = listedServices.has(REQUIRED_SERVICES.recordStart);
+    if (
+      options &&
+      options.profile === 'teaching-replay' &&
+      !fakeDriverDetected &&
+      !simulationTaskServerDetected
+    ) {
+      // The real controller exposes FollowJointTrajectory even when rosapi
+      // omits hidden action services from its advertisement list.
+      return guardedCall(
+        () => client.followJointTrajectory(JOINT_NAMES, points, options),
+        optimisticMessage
+      );
+    }
+    if (shouldUseLowLevelTrajectory()) {
       setMessage(t('msg.simLowLevelSuffix', {label: optimisticMessage}));
       writeLog(t('log.lowLevelSuffix', {label: optimisticMessage}), 'info');
-     await replayTrajectoryLowLevel(points);
-      return;
+      return replayTrajectoryLowLevel(points);
     }
-    if (!hasActionServer(`/${NS}/follow_joint_trajectory`)) {
+    if (!hasActionServer(FOLLOW_JOINT_TRAJECTORY_ACTION)) {
       writeLog(t('log.lowLevelFallbackWarn'), 'warn');
-      await replayTrajectoryLowLevel(points);
-      return;
+      return replayTrajectoryLowLevel(points);
     }
-    await guardedCall(() => client.followJointTrajectory(JOINT_NAMES, points), optimisticMessage);
+    return guardedCall(
+      () => client.followJointTrajectory(JOINT_NAMES, points, options),
+      optimisticMessage
+    );
   }
 
   async function replayTrajectoryLowLevel(points) {
-    cancelLowLevelPlayback();
     const playback = { cancelled: false };
     lowLevelPlayback = playback;
    const started = performance.now();
     writeLog(t('log.lowLevelStart', {n: points.length}), 'ok');
+    let completed = false;
    for (const point of points) {
       if (playback.cancelled || !controlAllowed(false)) break;
-      const targetMs = rosTimeToSeconds(point.time_from_start) * 1000;
-      const waitMs = Math.max(0, targetMs - (performance.now() - started));
-      if (waitMs > 0) await sleep(waitMs);
-      JOINT_NAMES.forEach((name, index) => {
+     const targetMs = rosTimeToSeconds(point.time_from_start) * 1000;
+     const waitMs = Math.max(0, targetMs - (performance.now() - started));
+      if (waitMs > 0 && !(await interruptibleSleep(waitMs, playback))) break;
+     JOINT_NAMES.forEach((name, index) => {
         const pos = Number(point.positions[index]);
         if (Number.isFinite(pos)) {
           simTargetAngles.set(name, pos);
           client.publishJointCommand(name, pos, { vlim: getVlim() });
         }
       });
-      syncSimArmFromTrajectoryPoint(point);
+     syncSimArmFromTrajectoryPoint(point);
+     completed = true;
+   }
+   if (lowLevelPlayback === playback) lowLevelPlayback = null;
+   writeLog(playback.cancelled ? t('log.lowLevelCancelled') : t('log.lowLevelDone'), playback.cancelled ? 'warn' : 'ok');
+    return completed;
+  }
+
+  async function interruptibleSleep(ms, playback) {
+    const deadline = performance.now() + Math.max(0, ms);
+    while (true) {
+      if (playback.cancelled || !controlAllowed(false)) return false;
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) break;
+      await sleep(Math.min(80, remaining));
     }
-    if (lowLevelPlayback === playback) lowLevelPlayback = null;
-    writeLog(playback.cancelled ? t('log.lowLevelCancelled') : t('log.lowLevelDone'), playback.cancelled ? 'warn' : 'ok');
+    return !playback.cancelled && controlAllowed(false);
   }
 
   function syncSimArmFromTrajectoryPoint(point) {
@@ -647,13 +1283,68 @@ const NS = 'rebotarm';
   }
 
   function makeTrajectoryPoint(positions, seconds) {
+    return makeTrajectoryPointAtNs(positions, secondsToNs(seconds));
+  }
+
+  function makeTrajectoryPointAtNs(positions, timeNs) {
     return {
       positions,
       velocities: JOINT_NAMES.map(() => 0),
       accelerations: [],
       effort: [],
-      time_from_start: secondsToRosTime(seconds)
+      time_from_start: nsToRosStamp(timeNs)
     };
+  }
+
+  function withFiniteDifferenceVelocities(points) {
+    if (!Array.isArray(points) || points.length < 2) return points;
+    const times = points.map((point) => rosTimeToSeconds(point.time_from_start));
+    return points.map((point, index) => {
+      const velocities = JOINT_NAMES.map(() => 0);
+      if (index === 0 || index === points.length - 1) return { ...point, velocities };
+
+      const previous = points[index - 1];
+      const next = points[index + 1];
+      const dt = times[index + 1] - times[index - 1];
+      if (dt <= 1e-6) return { ...point, velocities };
+      JOINT_NAMES.forEach((_, jointIndex) => {
+        const left = Number(previous.positions[jointIndex]);
+        const right = Number(next.positions[jointIndex]);
+        const velocity = (right - left) / dt;
+        velocities[jointIndex] = Number.isFinite(velocity) ? velocity : 0;
+      });
+      return { ...point, velocities };
+    });
+  }
+
+  function validRosStamp(stamp) {
+    return rosStampToNs(stamp) !== null;
+  }
+
+  function rosStampToNs(stamp) {
+    const sec = Number(stamp && stamp.sec);
+    const nanosec = Number(stamp && stamp.nanosec);
+    if (
+      !Number.isInteger(sec) ||
+      !Number.isInteger(nanosec) ||
+      sec < 0 ||
+      nanosec < 0 ||
+      nanosec > 999999999
+    ) return null;
+    return BigInt(sec) * 1000000000n + BigInt(nanosec);
+  }
+
+  function nsToRosStamp(ns) {
+    const normalized = ns < 0n ? 0n : ns;
+    return {
+      sec: Number(normalized / 1000000000n),
+      nanosec: Number(normalized % 1000000000n)
+    };
+  }
+
+  function millisecondsToNs(milliseconds) {
+    const value = Math.max(0, Number(milliseconds) || 0);
+    return BigInt(Math.round(value * 1e6));
   }
 
   function getCurrentRosPositions() {
@@ -715,7 +1406,10 @@ const NS = 'rebotarm';
 
   async function disconnectRos() {
     if (safeDisconnectBusy) return;
-    cancelLowLevelPlayback();
+    await requestTrajectoryStop();
+    await stopHardwareTeaching(true);
+    simTargetAngles.clear();
+    mirrorHoldUntil.clear();
 
     if (!els.safeDisconnect || !els.safeDisconnect.checked || !client.connected) {
       client.disconnect();
@@ -769,7 +1463,7 @@ const NS = 'rebotarm';
       const message = formatServiceResult(result);
       if (!(options && options.silent)) {
         setMessage(message);
-        writeLog(message, result && result.accepted === false ? 'warn' : 'ok');
+        writeLog(message, rosResultFailed(result) ? 'warn' : 'ok');
       }
       return result;
     } catch (error) {
@@ -788,11 +1482,21 @@ const NS = 'rebotarm';
   function formatServiceResult(result) {
     if (!result) return t('log.rosCallDone');
     if (typeof result.accepted === 'boolean') return result.accepted ? t('msg.goalAccepted') : t('msg.goalRejected');
+    if (typeof result.error_string === 'string' && result.error_string.trim()) return result.error_string.trim();
    if (typeof result.message === 'string' && result.message) return result.message;
     if (typeof result.reached_position === 'number') return t('msg.gripperReached', {mm: Math.round(result.reached_position * 1000)});
     if (Array.isArray(result.q_solution)) return t('log.ikResult', {result: result.success ? t('log.ikSuccess') : t('log.ikFail'), q: result.q_solution.map((v) => Number(v).toFixed(3)).join(', ')});
    if (typeof result.success === 'boolean') return result.success ? t('log.rosCallSuccess') : t('log.rosCallFail');
     return t('log.rosCallDone');
+  }
+
+  function rosResultFailed(result) {
+    if (!result || typeof result !== 'object') return false;
+    if (result.accepted === false || result.success === false) return true;
+    const status = Number(result.status);
+    if (Number.isFinite(status) && status !== 3) return true;
+    const errorCode = Number(result.error_code);
+    return Number.isFinite(errorCode) && errorCode !== 0;
   }
 
  function updateDiagnostics() {
@@ -1098,6 +1802,10 @@ const NS = 'rebotarm';
 
   async function moveAboveVisionTarget() {
     if (!controlAllowed(true)) return;
+    if (trajectoryBusy) {
+      warnTrajectoryBusy();
+      return;
+    }
     const mode = els.visionColor ? String(els.visionColor.value || 'auto') : 'auto';
     let target = mode === 'auto'
       ? (selectedVisionTarget || chooseVisionTarget())
@@ -1220,6 +1928,10 @@ const NS = 'rebotarm';
   async function runVisionPickDemo() {
     if (visionSequenceBusy) return;
     if (!controlAllowed(true)) return;
+    if (trajectoryBusy) {
+      warnTrajectoryBusy();
+      return;
+    }
     const preferredColor = els.visionColor ? String(els.visionColor.value || 'auto') : 'auto';
     let target = await waitForFreshVisionTarget(preferredColor, 700);
     if (preferredColor === 'auto') {
@@ -1337,6 +2049,10 @@ const NS = 'rebotarm';
   async function runVisionPlaceDemo() {
     if (visionSequenceBusy) return;
     if (!controlAllowed(true)) return;
+    if (trajectoryBusy) {
+      warnTrajectoryBusy();
+      return;
+    }
 
     const simCarriedColor = window.reBotSim && typeof window.reBotSim.getCarriedObject === 'function'
       ? window.reBotSim.getCarriedObject()
@@ -1505,27 +2221,24 @@ const NS = 'rebotarm';
   }
 
   async function sendVisionMoveGoal(pose, duration, optimisticMessage) {
+    if (trajectoryBusy) {
+      warnTrajectoryBusy();
+      return { success: false, localPlayback: false };
+    }
     if (shouldUseLowLevelTrajectory() || !hasActionServer(`/${NS}/move_to_pose`)) {
       return moveToPoseViaIkTrajectory(pose, duration, optimisticMessage);
     }
 
-    try {
-      setMessage(optimisticMessage);
-      writeLog(optimisticMessage, 'info');
-      const result = await client.moveToPose(pose, duration);
-      const message = formatServiceResult(result);
-      setMessage(message);
-      writeLog(message, result && result.accepted === false ? 'warn' : 'ok');
-      return { ...(result || {}), localPlayback: false };
-    } catch (error) {
-      const message = error && error.message ? error.message : t('msg.visionMoveFail');
-      setStatus('error', message);
-      writeLog(message, 'error');
-      return { success: false, localPlayback: false };
-    }
+    const result = await sendMoveToPose(pose, duration, optimisticMessage);
+    if (!result) return { success: false, localPlayback: false };
+    return { ...result, localPlayback: false };
   }
 
  async function moveToPoseViaIkTrajectory(pose, duration, optimisticMessage) {
+    if (trajectoryBusy) {
+      warnTrajectoryBusy();
+      return { success: false, localPlayback: true };
+    }
     setMessage(t('msg.ikSolving', {label: optimisticMessage}));
     writeLog(t('msg.ikSolving', {label: optimisticMessage}), 'info');
    const ik = await guardedCall(
@@ -1803,6 +2516,10 @@ const NS = 'rebotarm';
 
   function maybeSendGripper(position) {
     syncSimGripper(position);
+    if (trajectoryBusy) {
+      warnTrajectoryBusy();
+      return;
+    }
     if (!client.connected) {
       setMessage(t('msg.gripperSimOnly'));
       return;
@@ -1816,6 +2533,10 @@ const NS = 'rebotarm';
 
   function sendGripper(position, options) {
     syncSimGripper(position);
+    if (trajectoryBusy) {
+      warnTrajectoryBusy();
+      return;
+    }
     if (
       options &&
       options.requireControl &&
@@ -1943,6 +2664,7 @@ const NS = 'rebotarm';
   }
 
   function publishGripper(position) {
+    gripperAssistActive = false;
     syncSimGripper(position);
     client.publishGripperCommand(position);
     simTargetAngles.set('gripper', position);
@@ -1970,8 +2692,12 @@ const NS = 'rebotarm';
   }
 
   function secondsToRosTime(seconds) {
-    const sec = Math.floor(seconds);
-    return { sec, nanosec: Math.round((seconds - sec) * 1e9) };
+    return nsToRosStamp(secondsToNs(seconds));
+  }
+
+  function secondsToNs(seconds) {
+    const value = Math.max(0, Number(seconds) || 0);
+    return BigInt(Math.round(value * 1e9));
   }
 
   function rosTimeToSeconds(time) {

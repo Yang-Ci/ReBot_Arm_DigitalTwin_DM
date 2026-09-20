@@ -13,6 +13,7 @@ from .conversions import pose_to_xyz_rpy
 _FOLLOW_TRAJECTORY_START_TOL = 0.10
 _FOLLOW_TRAJECTORY_SETTLE_TIMEOUT = 2.0
 _FOLLOW_TRAJECTORY_GOAL_TOLERANCE = 0.03
+_FOLLOW_TRAJECTORY_UPDATE_PERIOD = 0.01
 
 
 class ArmActions:
@@ -152,6 +153,9 @@ class ArmActions:
             goal_handle.abort()
             result.error_code = FollowJointTrajectory.Result.INVALID_GOAL
             result.error_string = "trajectory must include joint_names and points"
+            self._node.get_logger().warn(
+                f"follow_joint_trajectory rejected: {result.error_string}"
+            )
             return result
 
         try:
@@ -165,6 +169,9 @@ class ArmActions:
             goal_handle.abort()
             result.error_code = FollowJointTrajectory.Result.INVALID_GOAL
             result.error_string = str(exc)
+            self._node.get_logger().warn(
+                f"follow_joint_trajectory rejected: {result.error_string}"
+            )
             return result
 
         trajectory_done = False
@@ -177,11 +184,19 @@ class ArmActions:
         try:
             self._hardware.ensure_pos_vel_control()
 
-            for target_time, target in zip(sample_times[1:], sample_positions[1:]):
-                if not self._wait_until_time(goal_handle, start + target_time, result):
+            for index in range(1, len(sample_times)):
+                target_time = sample_times[index]
+                target = sample_positions[index]
+                if not self._follow_trajectory_segment(
+                    goal_handle,
+                    start,
+                    sample_times[index - 1],
+                    target_time,
+                    sample_positions[index - 1],
+                    target,
+                    result,
+                ):
                     return result
-
-                self._set_endpos_target(list(trajectory.joint_names), target)
 
                 desired = JointTrajectoryPoint()
                 desired.positions = [float(v) for v in target]
@@ -195,6 +210,9 @@ class ArmActions:
             goal_handle.abort()
             result.error_code = FollowJointTrajectory.Result.INVALID_GOAL
             result.error_string = str(exc)
+            self._node.get_logger().error(
+                f"follow_joint_trajectory execution failed: {result.error_string}"
+            )
             return result
         finally:
             self._hardware.set_state_machine("IDLE")
@@ -204,6 +222,9 @@ class ArmActions:
             goal_handle.abort()
             result.error_code = FollowJointTrajectory.Result.INVALID_GOAL
             result.error_string = "trajectory interrupted"
+            self._node.get_logger().warn(
+                f"follow_joint_trajectory aborted: {result.error_string}"
+            )
             return result
 
         self._set_endpos_target(list(trajectory.joint_names), sample_positions[-1])
@@ -220,6 +241,9 @@ class ArmActions:
                 "trajectory goal not reached within tolerance "
                 f"(max error {max_error:.3f} rad > "
                 f"{_FOLLOW_TRAJECTORY_GOAL_TOLERANCE:.3f} rad)"
+            )
+            self._node.get_logger().warn(
+                f"follow_joint_trajectory aborted: {result.error_string}"
             )
             return result
         goal_handle.succeed()
@@ -291,8 +315,26 @@ class ArmActions:
 
         return sample_times, sample_positions
 
-    def _wait_until_time(self, goal_handle, target_time: float, result) -> bool:
-        while time.monotonic() < target_time:
+    def _follow_trajectory_segment(
+        self,
+        goal_handle,
+        trajectory_start: float,
+        segment_start_time: float,
+        segment_end_time: float,
+        segment_start: np.ndarray,
+        segment_end: np.ndarray,
+        result,
+    ) -> bool:
+        """Continuously interpolate one trajectory segment.
+
+        The motor loop runs faster than the incoming trajectory waypoints. Updating
+        its position target throughout each segment avoids making the motor's
+        internal position loop chase a staircase of waypoint-sized jumps.
+        """
+        segment_duration = segment_end_time - segment_start_time
+        deadline = trajectory_start + segment_end_time
+
+        while True:
             if goal_handle.is_cancel_requested:
                 self._hardware.hold_current_position()
                 self._hardware.set_state_machine("IDLE")
@@ -307,7 +349,35 @@ class ArmActions:
                 result.error_code = FollowJointTrajectory.Result.INVALID_GOAL
                 result.error_string = "preempted"
                 return False
-            time.sleep(0.01)
+
+            now = time.monotonic()
+            if now >= deadline:
+                break
+
+            if segment_duration <= 1e-9:
+                target = segment_end
+            else:
+                elapsed = now - trajectory_start
+                ratio = float(
+                    np.clip(
+                        (elapsed - segment_start_time) / segment_duration,
+                        0.0,
+                        1.0,
+                    )
+                )
+                target = segment_start + (segment_end - segment_start) * ratio
+            self._set_endpos_target(
+                list(goal_handle.request.trajectory.joint_names),
+                target,
+            )
+            time.sleep(
+                min(_FOLLOW_TRAJECTORY_UPDATE_PERIOD, max(0.0, deadline - now))
+            )
+
+        self._set_endpos_target(
+            list(goal_handle.request.trajectory.joint_names),
+            segment_end,
+        )
         return True
 
     def _wait_until_goal_reached(
