@@ -410,15 +410,16 @@ std_srvs/srv/Trigger
 
 类型均为 `std_srvs/srv/Trigger`。`start` 将夹爪切入受限 MIT 助力模式：静止时前馈力矩为零，手动运动超过速度阈值后平滑增加同向助力，接近机械行程两端或超过速度上限时撤掉助力。`status` 的 `success=true` 表示助力正在运行。
 
-安全相关参数：
+速度刚超过阈值时会先给起手助力，再随速度平滑增加到上限。安全相关参数：
 
 | 参数 | 默认值 | 说明 |
 |---|---:|---|
-| `gripper_assist_torque` | `0.02` | 最大电机侧助力力矩，N·m；代码硬上限 `0.08` |
-| `gripper_assist_kd` | `0.015` | MIT 速度阻尼 |
-| `gripper_assist_velocity_threshold` | `0.08` | 开始助力的速度阈值，rad/s |
-| `gripper_assist_velocity_full` | `0.35` | 达到最大助力的速度，rad/s |
+| `gripper_assist_torque` | `0.04` | 最大电机侧助力力矩，N·m；代码硬上限 `0.08` |
+| `gripper_assist_kd` | `0.001` | MIT 速度阻尼 |
+| `gripper_assist_velocity_threshold` | `0.02` | 开始助力的速度阈值，rad/s |
+| `gripper_assist_velocity_full` | `0.22` | 达到最大助力的速度，rad/s |
 | `gripper_assist_speed_limit` | `0.8` | 撤掉前馈助力的速度上限，rad/s |
+| `gripper_assist_breakaway_fraction` | `0.30` | 速度刚超过阈值时的起手助力比例 |
 
 任何夹爪位置、MIT 或速度命令都会退出助力模式。调用 `/gripper/release` 会以失能方式退出；调用 `/gripper/hold` 或停止重力补偿会从当前位置恢复位置保持。
 

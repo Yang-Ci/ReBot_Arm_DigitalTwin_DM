@@ -37,11 +37,12 @@ class HardwareManager:
         arm_cfg: Optional[str] = None,
         gripper_cfg: Optional[str] = None,
         channel: str = "",
-        gripper_assist_torque: float = 0.02,
-        gripper_assist_kd: float = 0.015,
-        gripper_assist_velocity_threshold: float = 0.08,
-        gripper_assist_velocity_full: float = 0.35,
+        gripper_assist_torque: float = 0.04,
+        gripper_assist_kd: float = 0.001,
+        gripper_assist_velocity_threshold: float = 0.02,
+        gripper_assist_velocity_full: float = 0.22,
         gripper_assist_speed_limit: float = 0.8,
+        gripper_assist_breakaway_fraction: float = 0.30,
     ) -> None:
         self._sdk_root = self._ensure_rebot_sdk_in_syspath()
 
@@ -98,6 +99,11 @@ class HardwareManager:
             gripper_assist_speed_limit,
             self._gripper_assist_velocity_full,
             _G_ASSIST_SPEED_MAX,
+        ))
+        self._gripper_assist_breakaway_fraction = float(np.clip(
+            gripper_assist_breakaway_fraction,
+            0.0,
+            0.5,
         ))
 
         self._endpos_ctrl = RebotArmEndPose(self._arm, arm_control_mode="posvel")
@@ -915,7 +921,7 @@ class HardwareManager:
 
     def _gripper_assist_feedforward(self, position: float, velocity: float) -> float:
         speed = abs(float(velocity))
-        if speed < self._gripper_assist_velocity_threshold:
+        if speed <= self._gripper_assist_velocity_threshold:
             return 0.0
         if speed >= self._gripper_assist_speed_limit:
             return 0.0
@@ -936,6 +942,7 @@ class HardwareManager:
             0.0,
             1.0,
         ))
+        ramp = max(ramp, self._gripper_assist_breakaway_fraction)
         return direction * self._gripper_assist_torque * ramp
 
     def send_gripper_motor_cmd(self, cmd) -> None:
@@ -1073,8 +1080,8 @@ class HardwareManager:
                 # Low-pass velocity before deciding the assist direction so
                 # encoder noise cannot chatter the feed-forward torque.
                 self._gripper_assist_velocity = (
-                    0.75 * self._gripper_assist_velocity
-                    + 0.25 * self._gripper_vel
+                    0.70 * self._gripper_assist_velocity
+                    + 0.30 * self._gripper_vel
                 )
                 assist_velocity = self._gripper_assist_velocity
             else:

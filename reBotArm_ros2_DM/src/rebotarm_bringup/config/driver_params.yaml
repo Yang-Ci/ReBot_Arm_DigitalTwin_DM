@@ -5,11 +5,12 @@ reBotArmController:
     safe_home_max_vel: 0.8
     # Experimental opt-in hand-guidance for the gripper. Torque is motor-side
     # N*m and is clamped to 0.08 by the controller.
-    gripper_assist_torque: 0.02
-    gripper_assist_kd: 0.015
-    gripper_assist_velocity_threshold: 0.08
-    gripper_assist_velocity_full: 0.35
+    gripper_assist_torque: 0.04
+    gripper_assist_kd: 0.001
+    gripper_assist_velocity_threshold: 0.02
+    gripper_assist_velocity_full: 0.22
     gripper_assist_speed_limit: 0.8
+    gripper_assist_breakaway_fraction: 0.30
     cmd_arbitration: reject
     channel: ""
     frame_id: base_link

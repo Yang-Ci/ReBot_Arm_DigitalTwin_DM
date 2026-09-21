@@ -26,11 +26,12 @@ class reBotArmController(Node):
         self.declare_parameter("channel", "")
         self.declare_parameter("joint_state_rate", 100.0)
         self.declare_parameter("safe_home_max_vel", 0.8)
-        self.declare_parameter("gripper_assist_torque", 0.02)
-        self.declare_parameter("gripper_assist_kd", 0.015)
-        self.declare_parameter("gripper_assist_velocity_threshold", 0.08)
-        self.declare_parameter("gripper_assist_velocity_full", 0.35)
+        self.declare_parameter("gripper_assist_torque", 0.04)
+        self.declare_parameter("gripper_assist_kd", 0.001)
+        self.declare_parameter("gripper_assist_velocity_threshold", 0.02)
+        self.declare_parameter("gripper_assist_velocity_full", 0.22)
         self.declare_parameter("gripper_assist_speed_limit", 0.8)
+        self.declare_parameter("gripper_assist_breakaway_fraction", 0.30)
         self.declare_parameter("arm_namespace", "rebotarm")
         self.declare_parameter("cmd_arbitration", "reject")
         self.declare_parameter("frame_id", "base_link")
@@ -75,6 +76,9 @@ class reBotArmController(Node):
             ),
             gripper_assist_speed_limit=float(
                 self.get_parameter("gripper_assist_speed_limit").value
+            ),
+            gripper_assist_breakaway_fraction=float(
+                self.get_parameter("gripper_assist_breakaway_fraction").value
             ),
         )
         self.hardware.connect()

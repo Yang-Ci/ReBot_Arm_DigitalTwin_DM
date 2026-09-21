@@ -63,10 +63,11 @@ class _FakeArmGroup:
 class GravityCompensationTests(unittest.TestCase):
     def test_gripper_assist_is_zero_at_rest_limits_and_high_speed(self) -> None:
         manager = HardwareManager.__new__(HardwareManager)
-        manager._gripper_assist_velocity_threshold = 0.08
-        manager._gripper_assist_velocity_full = 0.35
+        manager._gripper_assist_velocity_threshold = 0.02
+        manager._gripper_assist_velocity_full = 0.22
         manager._gripper_assist_speed_limit = 0.8
-        manager._gripper_assist_torque = 0.02
+        manager._gripper_assist_torque = 0.04
+        manager._gripper_assist_breakaway_fraction = 0.30
 
         self.assertEqual(manager._gripper_assist_feedforward(-2.5, 0.02), 0.0)
         self.assertEqual(manager._gripper_assist_feedforward(-0.1, 0.2), 0.0)
@@ -75,8 +76,12 @@ class GravityCompensationTests(unittest.TestCase):
         self.assertGreater(manager._gripper_assist_feedforward(-2.5, 0.2), 0.0)
         self.assertLess(manager._gripper_assist_feedforward(-2.5, -0.2), 0.0)
         self.assertAlmostEqual(
-            manager._gripper_assist_feedforward(-2.5, 0.35),
-            0.02,
+            manager._gripper_assist_feedforward(-2.5, 0.22),
+            0.04,
+        )
+        self.assertAlmostEqual(
+            manager._gripper_assist_feedforward(-2.5, -0.021),
+            -0.012,
         )
 
     def test_start_gripper_assist_enters_limited_mit_mode(self) -> None:
